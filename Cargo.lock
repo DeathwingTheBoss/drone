@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "drone"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "actix-web",
  "lru_time_cache",

@@ -1,7 +1,7 @@
 use std::{time::Duration, sync::Mutex};
 use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder, HttpRequest};
 use serde::{Deserialize, Serialize};
-use reqwest::{Client};
+use reqwest::{Client, ClientBuilder};
 use lru_time_cache::LruCache;
 use serde_json::Value;
 
@@ -9,12 +9,12 @@ use serde_json::Value;
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DRONE_PORT: u16 = 8999;
 const DRONE_HOST: &str = "0.0.0.0";
-const DRONE_CACHE_TTL: Duration = Duration::from_secs(60);
-const DRONE_CACHE_COUNT: usize = 100;
-const DRONE_OPERATOR_MESSAGE: &str = "Hive API Cluster - Drone by Deathwing";
-const DRONE_HAF_ENDPOINT_IP: &str = "http://HAF_IP:1234";
-const DRONE_HAFAH_ENDPOINT_IP: &str = "http://HAFAH_IP:1234";
-const DRONE_HIVEMIND_ENDPOINT_IP: &str = "http://HIVEMIND_IP:1234";
+const DRONE_CACHE_TTL: Duration = Duration::from_secs(300);
+const DRONE_CACHE_COUNT: usize = 250;
+const DRONE_OPERATOR_MESSAGE: &str = "Drone by Deathwing";
+const DRONE_HAF_ENDPOINT_IP: &str = "http://HAFIP:PORT"; // Set this to your HAF endpoint. (http://HAFIP:PORT)
+const DRONE_HAFAH_ENDPOINT_IP: &str = "http://HAFAHIP:PORT"; // Set this to your HAFAH endpoint. (http://HAFAHIP:PORT)
+const DRONE_HIVEMIND_ENDPOINT_IP: &str = "http://HIVEMINDIP:PORT"; // Set this to your HIVEMIND endpoint. (http://HIVEMINDIP:PORT)
 
 // Drone Cacheable Methods
 const DRONE_CACHEABLE_METHODS: [&str; 7] = [
@@ -81,11 +81,11 @@ impl Endpoints {
 }
 
 #[post("/")]
-async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<Cache>) -> impl Responder {
+async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<APIFunctions>) -> impl Responder {
 
     // Convert the call to a struct.
     let call = call.into_inner();
-    let client = Client::new();
+    let client = data.webclient.clone();
     let json_rpc_call = APICall {
         jsonrpc: "2.0".to_string(),
         id: call.id,
@@ -151,7 +151,6 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<Ca
         .insert_header(("Drone-Version", DRONE_VERSION))
         .insert_header(("Cache-Status", cache_status))
         .json(cached_call);
-        
     }
 
     // Send the request to the endpoints.
@@ -202,16 +201,21 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<Ca
 
 
 
-struct Cache {
-    cache: Mutex<LruCache<String, Value>>
+struct APIFunctions {
+    cache: Mutex<LruCache<String, Value>>,
+    webclient: Client,
 }
 
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Create the cache.
-    let mut _cache = web::Data::new(Cache {
-        cache: Mutex::new(LruCache::<String, serde_json::Value>::with_expiry_duration_and_capacity(DRONE_CACHE_TTL, DRONE_CACHE_COUNT))
+    let _cache = web::Data::new(APIFunctions {
+        cache: Mutex::new(LruCache::<String, serde_json::Value>::with_expiry_duration_and_capacity(DRONE_CACHE_TTL, DRONE_CACHE_COUNT)),
+        webclient: ClientBuilder::new()
+            .pool_max_idle_per_host(8)
+            .build()
+            .unwrap(),
     });
     HttpServer::new(move || {
         App::new()
