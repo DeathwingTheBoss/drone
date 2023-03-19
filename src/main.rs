@@ -1,5 +1,5 @@
 use std::{time::Duration, sync::Mutex};
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder, HttpRequest};
+use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest};
 use serde::{Deserialize, Serialize};
 use reqwest::{Client, ClientBuilder};
 use lru_time_cache::LruCache;
@@ -35,7 +35,7 @@ struct HealthCheck {
     message: String,
 }
 
-#[get("/")]
+// Use Index for both / and /health.
 async fn index() -> impl Responder {
     // Reply with health check JSON.
     HttpResponse::Ok().json(HealthCheck {
@@ -80,7 +80,6 @@ impl Endpoints {
     }
 }
 
-#[post("/")]
 async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<APIFunctions>) -> impl Responder {
 
     // Convert the call to a struct.
@@ -93,9 +92,14 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
         params: call.params,
     };
 
-    // Print request details.
+    // Log the request, if there's Cloudflare header (CF-Connecting-IP) use that instead of peer_addr.
+    let get_cloudflare_ip = req.headers().get("CF-Connecting-IP");
+    let client_ip = match get_cloudflare_ip {
+        Some(ip) => ip.to_str().unwrap().to_string(),
+        None => req.peer_addr().unwrap().ip().to_string(),
+    };    
     let formatted_log = 
-    format!("IP: {} || HTTP Version: {:?} || Request Method: {} || Request Params: {}", req.peer_addr().unwrap(), req.version(), json_rpc_call.method, json_rpc_call.params);
+    format!("IP: {} || HTTP Version: {:?} || Request Method: {} || Request Params: {}", client_ip, req.version(), json_rpc_call.method, json_rpc_call.params);
     println!("{}", formatted_log);
     // Pick the endpoints depending on the method.
     let endpoints = match json_rpc_call.method.as_str() {
@@ -220,8 +224,9 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(_cache.clone())
-            .service(index)
-            .service(api_call)
+            .route("/", web::get().to(index))
+            .route("/", web::post().to(api_call))
+            .route("/health", web::get().to(index))
     })
     .bind((DRONE_HOST, DRONE_PORT))?
     .run()
