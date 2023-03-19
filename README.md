@@ -41,9 +41,9 @@ Drone comes with pre-determined settings, these should be edited before building
 DRONE_VERSION: Application version, fetched from the Cargo package metadata.
 DRONE_PORT: The port on which the application will listen for incoming connections (default: 8999).
 DRONE_HOST: The hostname/IP address the application will bind to (default: "localhost").
-DRONE_CACHE_TTL: Time-to-live for cache entries (default: 60 seconds).
-DRONE_CACHE_COUNT: Maximum number of entries the cache can hold (default: 100).
-DRONE_OPERATOR_MESSAGE: Customizable message from the operator (default: "Hive API Cluster - Drone by Deathwing").
+DRONE_CACHE_TTL: Time-to-live for cache entries (default: 300 seconds).
+DRONE_CACHE_COUNT: Maximum number of entries the cache can hold (default: 250).
+DRONE_OPERATOR_MESSAGE: Customizable message from the operator (default: "Drone by Deathwing").
 DRONE_HAF_ENDPOINT_IP: HAF Endpoint that Drone can connect to relay HAF related API calls.
 DRONE_HAFAH_ENDPOINT_IP: HAFAH Endpoint that Drone can connect to relay HAFAH related API calls.
 DRONE_HIVEMIND_ENDPOINT_IP: Hivemind Endpoint that Drone can connect to relay Hivemind related API calls.
