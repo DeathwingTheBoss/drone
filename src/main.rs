@@ -1,9 +1,10 @@
-use std::{time::Duration, sync::Mutex};
+use std::{time::Duration, sync::Mutex, fs::{File, OpenOptions}};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest};
 use serde::{Deserialize, Serialize};
 use reqwest::{Client, ClientBuilder};
 use lru_time_cache::LruCache;
 use serde_json::Value;
+use std::io::Write;
 
 // Drone Configuration Parameters
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -92,6 +93,9 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
         params: call.params,
     };
 
+    // Get humantime for logging.
+    let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
+
     // Log the request, if there's Cloudflare header (CF-Connecting-IP) use that instead of peer_addr.
     let get_cloudflare_ip = req.headers().get("CF-Connecting-IP");
     let client_ip = match get_cloudflare_ip {
@@ -99,8 +103,9 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
         None => req.peer_addr().unwrap().ip().to_string(),
     };    
     let formatted_log = 
-    format!("IP: {} || HTTP Version: {:?} || Request Method: {} || Request Params: {}", client_ip, req.version(), json_rpc_call.method, json_rpc_call.params);
-    println!("{}", formatted_log);
+    format!("Timestamp: {} || IP: {} || HTTP Version: {:?} || Request Method: {} || Request Params: {}", human_timestamp, client_ip, req.version(), json_rpc_call.method, json_rpc_call.params);
+    let mut log_file = data.log_file.lock().unwrap();
+    writeln!(log_file, "{}", formatted_log).unwrap();
     // Pick the endpoints depending on the method.
     let endpoints = match json_rpc_call.method.as_str() {
         // HAF
@@ -207,15 +212,23 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
 
 struct APIFunctions {
     cache: Mutex<LruCache<String, Value>>,
+    log_file: Mutex<File>,
     webclient: Client,
 }
 
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Create log file if it doesn't exist, if it does, read it.
+    let logger = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("drone.log")
+        .unwrap();
     // Create the cache.
     let _cache = web::Data::new(APIFunctions {
         cache: Mutex::new(LruCache::<String, serde_json::Value>::with_expiry_duration_and_capacity(DRONE_CACHE_TTL, DRONE_CACHE_COUNT)),
+        log_file: Mutex::new(logger),
         webclient: ClientBuilder::new()
             .pool_max_idle_per_host(8)
             .build()
