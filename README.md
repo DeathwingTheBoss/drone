@@ -4,12 +4,11 @@ Drone is an API caching layer application for the Hive blockchain. It is built u
 
 ## Features
 
-Written in Rust for optimal performance and reliability.
-Actix Web for high-performance, asynchronous HTTP handling.
-LRU cache with time-based expiration to store API responses.
-Multiple API endpoints support for seamless request handling.
-Caching support for select Hive API methods.
-Health check endpoint to monitor the application status.
+* Written in Rust for optimal performance and reliability.
+* Actix Web for high-performance, asynchronous HTTP handling.
+* LRU cache with time-based expiration to store API responses.
+* Multiple API endpoints support for seamless request handling with HAF apps.
+* Caching support for select Hive API methods to reduce strain on API nodes.
 
 
 ## Cached API Methods
@@ -52,8 +51,20 @@ DRONE_HIVEMIND_ENDPOINT_IP: Hivemind Endpoint that Drone can connect to relay Hi
 
 ## Usage
 
-To start the application, execute the following command:
+### Native
 
-`cargo run`
+To start the application after altering necessary configuration parameters such as `DRONE_HAF_ENDPOINT_IP` execute the following command:
 
-This will start the application and bind it to the pre-configured DRONE_HOST and DRONE_PORT. You can then send API requests to the POST / endpoint using a tool like curl or Postman.
+`cargo run --release`
+
+This will start the application and bind it to the pre-configured `DRONE_HOST` and `DRONE_PORT`. You can then send API requests to the POST / endpoint using a tool like curl or Postman.
+
+### Docker
+
+First, you have to build Drone using the following command:
+
+`docker build -t drone .`
+
+Then, you can run Drone container using the following command:
+
+`docker run -d -p 3000:8999 --name drone drone`

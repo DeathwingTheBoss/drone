@@ -8,7 +8,7 @@ use serde_json::Value;
 // Drone Configuration Parameters
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DRONE_PORT: u16 = 8999;
-const DRONE_HOST: &str = "localhost";
+const DRONE_HOST: &str = "0.0.0.0";
 const DRONE_CACHE_TTL: Duration = Duration::from_secs(60);
 const DRONE_CACHE_COUNT: usize = 100;
 const DRONE_OPERATOR_MESSAGE: &str = "Hive API Cluster - Drone by Deathwing";
