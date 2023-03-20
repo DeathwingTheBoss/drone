@@ -1,21 +1,13 @@
-use std::{time::Duration, sync::Mutex, fs::{File, OpenOptions}};
+use std::{time::Duration, sync::Mutex};
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest};
 use serde::{Deserialize, Serialize};
 use reqwest::{Client, ClientBuilder};
 use lru_time_cache::LruCache;
 use serde_json::Value;
-use std::io::Write;
+use serde_with::{DurationSeconds, serde_as};
+use config::Config;
 
-// Drone Configuration Parameters
-const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
-const DRONE_PORT: u16 = 8999;
-const DRONE_HOST: &str = "0.0.0.0";
-const DRONE_CACHE_TTL: Duration = Duration::from_secs(300);
-const DRONE_CACHE_COUNT: usize = 250;
-const DRONE_OPERATOR_MESSAGE: &str = "Drone by Deathwing";
-const DRONE_HAF_ENDPOINT_IP: &str = "http://HAFIP:PORT"; // Set this to your HAF endpoint. (http://HAFIP:PORT)
-const DRONE_HAFAH_ENDPOINT_IP: &str = "http://HAFAHIP:PORT"; // Set this to your HAFAH endpoint. (http://HAFAHIP:PORT)
-const DRONE_HIVEMIND_ENDPOINT_IP: &str = "http://HIVEMINDIP:PORT"; // Set this to your HIVEMIND endpoint. (http://HIVEMINDIP:PORT)
+const DRONE_VERSION: &str  = env!("CARGO_PKG_VERSION");
 
 // Drone Cacheable Methods
 const DRONE_CACHEABLE_METHODS: [&str; 7] = [
@@ -37,12 +29,12 @@ struct HealthCheck {
 }
 
 // Use Index for both / and /health.
-async fn index() -> impl Responder {
+async fn index(appdata: web::Data<AppData>) -> impl Responder {
     // Reply with health check JSON.
     HttpResponse::Ok().json(HealthCheck {
         status: "OK".to_string(),
         drone_version: DRONE_VERSION.to_string(),
-        message: DRONE_OPERATOR_MESSAGE.to_string(),
+        message: appdata.config.operator_message.to_string(),
     })
 }
 
@@ -72,16 +64,16 @@ enum Endpoints {
 
 // Choose the endpoint depending on the method.
 impl Endpoints {
-    fn choose_endpoint(&self) -> &'static str {
+    fn choose_endpoint<'a>(&self, appdata: &'a web::Data<AppData>) -> &'a str {
         match self {
-            Endpoints::HAF => DRONE_HAF_ENDPOINT_IP,
-            Endpoints::HAFAH => DRONE_HAFAH_ENDPOINT_IP,
-            Endpoints::HIVEMIND => DRONE_HIVEMIND_ENDPOINT_IP,
+            Endpoints::HAF => appdata.config.haf_endpoint.as_str(),
+            Endpoints::HAFAH => appdata.config.hafah_endpoint.as_str(),
+            Endpoints::HIVEMIND => appdata.config.hivemind_endpoint.as_str(),
         }
     }
 }
 
-async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<APIFunctions>) -> impl Responder {
+async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AppData>) -> impl Responder {
 
     // Convert the call to a struct.
     let call = call.into_inner();
@@ -103,9 +95,15 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
         None => req.peer_addr().unwrap().ip().to_string(),
     };    
     let formatted_log = 
-    format!("Timestamp: {} || IP: {} || HTTP Version: {:?} || Request Method: {} || Request Params: {}", human_timestamp, client_ip, req.version(), json_rpc_call.method, json_rpc_call.params);
-    let mut log_file = data.log_file.lock().unwrap();
-    writeln!(log_file, "{}", formatted_log).unwrap();
+    format!(
+        "Timestamp: {} || IP: {} || HTTP Version: {:?} || Request Method: {} || Request Params: {}",
+        human_timestamp,
+        client_ip, 
+        req.version(), 
+        json_rpc_call.method, 
+        json_rpc_call.params,
+    );
+    println!("{}", formatted_log);
     // Pick the endpoints depending on the method.
     let endpoints = match json_rpc_call.method.as_str() {
         // HAF
@@ -154,7 +152,8 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
     // Cache Status
     let mut cache_status = "MISS";
     // Check if the call is in the cache.
-    if let Some(cached_call) = data.cache.lock().unwrap().get(&json_rpc_call.params.to_string()) {
+    if let Some(cached_call) = 
+    data.cache.lock().unwrap().get(&json_rpc_call.params.to_string()) {
         cache_status = "HIT";
         return HttpResponse::Ok()
         .insert_header(("Drone-Version", DRONE_VERSION))
@@ -163,7 +162,7 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
     }
 
     // Send the request to the endpoints.
-    let res = match client.post(endpoints.choose_endpoint())
+    let res = match client.post(endpoints.choose_endpoint(&data))
         .json(&json_rpc_call)
         .send()
         .await {
@@ -190,7 +189,8 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
             error_data: err.to_string(),
         }),
     };
-    if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty() || json_body["result"].is_null() {
+    if json_body["result"].is_array() && 
+       json_body["result"].as_array().unwrap().is_empty() || json_body["result"].is_null() {
         return HttpResponse::InternalServerError().json(ErrorStructure {
             code: 4000,
             message: format!("Unable to parse endpoints data."),
@@ -210,30 +210,51 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<AP
 
 
 
-struct APIFunctions {
+struct AppData {
     cache: Mutex<LruCache<String, Value>>,
-    log_file: Mutex<File>,
     webclient: Client,
+    config: DroneConfig,
+}
+
+#[serde_as]
+#[derive(Clone, Deserialize, Debug)]
+#[serde(rename_all = "UPPERCASE")]
+struct DroneConfig {
+    port: u16,
+    hostname: String,
+    #[serde_as(as = "DurationSeconds<u64>")]
+    cache_ttl: Duration,
+    cache_count: usize,
+    operator_message: String,
+    haf_endpoint: String,
+    hafah_endpoint: String,
+    hivemind_endpoint: String,
+    actix_connection_threads: usize,
 }
 
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Create log file if it doesn't exist, if it does, read it.
-    let logger = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("drone.log")
-        .unwrap();
+    // Load config.
+    let config = Config::builder()
+    .add_source(config::File::with_name("config.json"))
+    .build()
+    .expect("Could not load config.json")
+    .try_deserialize::<DroneConfig>()
+    .expect("config.json is not in a valid format.");
+    
     // Create the cache.
-    let _cache = web::Data::new(APIFunctions {
-        cache: Mutex::new(LruCache::<String, serde_json::Value>::with_expiry_duration_and_capacity(DRONE_CACHE_TTL, DRONE_CACHE_COUNT)),
-        log_file: Mutex::new(logger),
+    let _cache = web::Data::new(AppData {
+        cache: Mutex::new(
+            LruCache::<String, serde_json::Value>
+            ::with_expiry_duration_and_capacity(config.cache_ttl, config.cache_count)),
         webclient: ClientBuilder::new()
-            .pool_max_idle_per_host(8)
+            .pool_max_idle_per_host(config.actix_connection_threads)
             .build()
             .unwrap(),
+        config: config.clone(),
     });
+    println!("Drone is running on port {}.", config.port);
     HttpServer::new(move || {
         App::new()
             .app_data(_cache.clone())
@@ -241,7 +262,8 @@ async fn main() -> std::io::Result<()> {
             .route("/", web::post().to(api_call))
             .route("/health", web::get().to(index))
     })
-    .bind((DRONE_HOST, DRONE_PORT))?
+    .bind((config.hostname, config.port))?
     .run()
     .await
+    
 }

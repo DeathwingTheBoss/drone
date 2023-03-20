@@ -35,36 +35,31 @@ The application has the following two primary endpoints:
 
 ## Configuration
 
-Drone comes with pre-determined settings, these should be edited before building the app as node operator sees fit.
+Drone comes with pre-determined settings, however, you will have to edit ENDPOINT settings in config.json before starting the application (or building the Docker image)
 
 ```
-DRONE_VERSION: Application version, fetched from the Cargo package metadata.
-DRONE_PORT: The port on which the application will listen for incoming connections (default: 8999).
-DRONE_HOST: The hostname/IP address the application will bind to (default: "localhost").
-DRONE_CACHE_TTL: Time-to-live for cache entries (default: 300 seconds).
-DRONE_CACHE_COUNT: Maximum number of entries the cache can hold (default: 250).
-DRONE_OPERATOR_MESSAGE: Customizable message from the operator (default: "Drone by Deathwing").
-DRONE_HAF_ENDPOINT_IP: HAF Endpoint that Drone can connect to relay HAF related API calls.
-DRONE_HAFAH_ENDPOINT_IP: HAFAH Endpoint that Drone can connect to relay HAFAH related API calls.
-DRONE_HIVEMIND_ENDPOINT_IP: Hivemind Endpoint that Drone can connect to relay Hivemind related API calls.
+PORT: The port on which the application will listen for incoming connections (default: 8999).
+HOSTNAME: The hostname/IP address the application will bind to (default: "0.0.0.0").
+CACHE_TTL: Time-to-live for cache entries (default: 300 seconds).
+CACHE_COUNT: Maximum number of entries the cache can hold (default: 250).
+OPERATOR_MESSAGE: Customizable message from the operator (default: "Drone by Deathwing").
+HAF_ENDPOINT: HAF Endpoint that Drone can connect to relay HAF related API calls.
+HAFAH_ENDPOINT: HAFAH Endpoint that Drone can connect to relay HAFAH related API calls.
+HIVEMIND_ENDPOINT: Hivemind Endpoint that Drone can connect to relay Hivemind related API calls.
 ```
 
 ## Usage
 
 ### Native
 
-To start the application after altering necessary configuration parameters such as `DRONE_HAF_ENDPOINT_IP` execute the following command:
+To start the application after altering necessary configuration parameters such as `HAF_ENDPOINT` execute the following command:
 
 `cargo run --release`
 
-This will start the application and bind it to the pre-configured `DRONE_HOST` and `DRONE_PORT`. You can then send API requests to the POST / endpoint using a tool like curl or Postman.
+If you are advanced and have knowledge about Rust, you can also build the binary using `cargo build --release` and then run it using `./target/release/drone`.
 
-### Docker
+### Docker (Recommended)
 
-First, you have to build Drone using the following command:
+You can use docker-compose to build and run Drone.
 
-`docker build -t drone .`
-
-Then, you can run Drone container using the following command:
-
-`docker run -d -p 3000:8999 --name drone drone`
+`docker-compose up --build -d`

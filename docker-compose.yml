@@ -1,0 +1,15 @@
+version: '2'
+
+services:
+    drone:
+        restart: "no"
+        build: .
+        image: "drone"
+        ports:
+        - "3000:8999"
+        container_name: drone
+        logging:
+            driver: "json-file"
+            options:
+                max-size: 1g
+                max-file: "1"

@@ -1,0 +1,11 @@
+{
+    "PORT": "8999",
+    "HOSTNAME": "0.0.0.0",
+    "CACHE_TTL": 300,
+    "CACHE_COUNT": 250,
+    "OPERATOR_MESSAGE": "Drone by Deathwing",
+    "HAF_ENDPOINT": "http://HAF:HAFPORT",
+    "HAFAH_ENDPOINT": "http://HAFAH:HAFAHPORT",
+    "HIVEMIND_ENDPOINT": "http://HIVEMIND:HIVEMINDPORT",
+    "ACTIX_CONNECTION_THREADS": 8
+}
