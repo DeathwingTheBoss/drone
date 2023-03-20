@@ -1,5 +1,5 @@
 use std::{time::Duration, sync::Mutex};
-use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest};
+use actix_web::{web::{self, JsonConfig}, App, HttpResponse, HttpServer, Responder, HttpRequest};
 use serde::{Deserialize, Serialize};
 use reqwest::{Client, ClientBuilder};
 use lru_time_cache::LruCache;
@@ -90,16 +90,25 @@ async fn api_call(req: HttpRequest, call: web::Json<APICall>, data: web::Data<Ap
 
     // Log the request, if there's Cloudflare header (CF-Connecting-IP) use that instead of peer_addr.
     let get_cloudflare_ip = req.headers().get("CF-Connecting-IP");
+
     let client_ip = match get_cloudflare_ip {
-        Some(ip) => ip.to_str().unwrap().to_string(),
-        None => req.peer_addr().unwrap().ip().to_string(),
-    };    
+        Some(ip) => ip.to_str().map(|ip| ip.to_string()),
+        None => Ok(req.peer_addr().unwrap().ip().to_string()),
+    };
+    let client_ip = match client_ip {
+        Ok(ip) => ip,
+        Err(_) => return HttpResponse::InternalServerError().json(ErrorStructure {
+            code: 9999,
+            message: "Internal Server Error".to_string(),
+            error_data: "Invalid Cloudflare Proxy Header.".to_string(),
+        }),
+    };
+    
     let formatted_log = 
     format!(
-        "Timestamp: {} || IP: {} || HTTP Version: {:?} || Request Method: {} || Request Params: {}",
+        "Timestamp: {} || IP: {} || Request Method: {} || Request Params: {}",
         human_timestamp,
         client_ip, 
-        req.version(), 
         json_rpc_call.method, 
         json_rpc_call.params,
     );
@@ -258,6 +267,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(_cache.clone())
+            .app_data(JsonConfig::default().content_type_required(false))
             .route("/", web::get().to(index))
             .route("/", web::post().to(api_call))
             .route("/health", web::get().to(index))
