@@ -7,9 +7,11 @@ services:
         image: "drone"
         ports:
         - "3000:8999"
+        volumes:
+        - ./config.json:/config.json
         container_name: drone
         logging:
             driver: "json-file"
             options:
-                max-size: 1g
+                max-size: 20g
                 max-file: "1"
