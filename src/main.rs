@@ -221,16 +221,15 @@ async fn handle_request(
             error: ErrorField::Object(json_body["error"].clone()),
         });
     }
+    let mut cacheable = true;
     if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
+    || json_body["result"].is_null() || json_body["result"]["blocks"].is_array() && 
+    json_body["result"]["blocks"].as_array().unwrap().is_empty()
     {
-        return Err(ErrorStructure {
-            code: 4000,
-            message: format!("Unable to parse endpoint data."),
-            error: ErrorField::Message("The endpoint returned an empty result.".to_string()),
-        });
+        cacheable = false;
     }
 
-    if DRONE_CACHEABLE_METHODS.contains(&request.method.as_str()) && !json_body["result"].is_null() {
+    if DRONE_CACHEABLE_METHODS.contains(&request.method.as_str()) && cacheable {
         data.cache
             .lock()
             .unwrap()
@@ -365,6 +364,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(web::JsonConfig::default()
             .content_type(|_| true)
+            .content_type_required(false)
             .limit(1024))
             .app_data(_cache.clone())
             .route("/", web::get().to(index))
