@@ -222,7 +222,6 @@ async fn handle_request(
         });
     }
     if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
-        || json_body["result"].is_null()
     {
         return Err(ErrorStructure {
             code: 4000,
@@ -231,7 +230,7 @@ async fn handle_request(
         });
     }
 
-    if DRONE_CACHEABLE_METHODS.contains(&request.method.as_str()) {
+    if DRONE_CACHEABLE_METHODS.contains(&request.method.as_str()) && !json_body["result"].is_null() {
         data.cache
             .lock()
             .unwrap()
@@ -360,11 +359,10 @@ async fn main() -> std::io::Result<()> {
         config: config.clone(),
     });
     println!("Drone is running on port {}.", config.port);
-    Cors::default()
-    .allow_any_origin()
-    .allowed_methods(vec!["GET", "POST"]);
     HttpServer::new(move || {
+        let cors = Cors::permissive();
         App::new()
+            .wrap(cors)
             .app_data(web::JsonConfig::default()
             .content_type(|_| true)
             .limit(1024))
