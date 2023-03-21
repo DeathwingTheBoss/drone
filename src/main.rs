@@ -188,7 +188,7 @@ async fn handle_request(
         Ok(response) => response,
         Err(err) => {
             return Err(ErrorStructure {
-                code: 1000,
+                code: -32700,
                 message: format!("Unable to send request to endpoint."),
                 error: ErrorField::Message(err.to_string()),
             })
@@ -198,7 +198,7 @@ async fn handle_request(
         Ok(text) => text,
         Err(err) => {
             return Err(ErrorStructure {
-                code: 2000,
+                code: -32600,
                 message: format!("Received an invalid response from the endpoint."),
                 error: ErrorField::Message(err.to_string()),
             })
@@ -216,7 +216,7 @@ async fn handle_request(
     };
     if json_body["error"].is_object() {
         return Err(ErrorStructure {
-            code: 4000,
+            code: -32602,
             message: format!("Endpoint returned an error."),
             error: ErrorField::Object(json_body["error"].clone()),
         });
@@ -284,6 +284,15 @@ async fn api_call(
         }
         APICall::Batch(requests) => {
             let mut responses = Vec::new();
+            // If there's over 100 in the batch, return an error.
+            if requests.len() > 100 {
+                return HttpResponse::InternalServerError().json(ErrorStructure {
+                    code: -32600,
+                    message: "Internal Server Error".to_string(),
+                    error: ErrorField::Message("Batch size too large.".to_string()),
+                });
+            }
+            
             for request in requests {
                 let result = handle_request(&request, &data, &user_ip).await;
                 match result {
@@ -365,7 +374,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::JsonConfig::default()
             .content_type(|_| true)
             .content_type_required(false)
-            .limit(1024))
+            .limit(1024 * 100)) // 100kb
             .app_data(_cache.clone())
             .route("/", web::get().to(index))
             .route("/", web::post().to(api_call))
