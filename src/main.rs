@@ -2,7 +2,7 @@ use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use config::Config;
 use lru_time_cache::LruCache;
 use reqwest::{Client, ClientBuilder};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use serde_with::{serde_as, DurationSeconds};
 use std::{sync::Mutex, time::Duration};
@@ -54,12 +54,30 @@ struct APIRequest {
     params: Value,
 }
 
+#[derive(Debug, Deserialize)]
+enum ErrorField {
+    Object(Value), // JSON from Hived
+    Message(String), // Custom message
+}
+
+impl Serialize for ErrorField {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            ErrorField::Object(json_value) => json_value.serialize(serializer),
+            ErrorField::Message(text) => text.serialize(serializer),
+        }
+    }
+}
+
 // Structure for the error response.
 #[derive(Serialize, Deserialize, Debug)]
 struct ErrorStructure {
     code: i32,
     message: String,
-    error: String,
+    error: ErrorField,
 }
 
 // Enum for the endpoints.
@@ -103,23 +121,21 @@ async fn handle_request(
         human_timestamp, client_ip, request.method, request.params,
     );
     println!("{}", formatted_log);
+    let method = request.method.as_str();
     // Pick the endpoints depending on the method.
-    let endpoints = match request.method.as_str() {
+    let endpoints = match method {
         // HAF
         "condenser_api.get_block" => Endpoints::HAF,
         "block_api.get_block_range" => Endpoints::HAF,
         "condenser_api.get_block_range" => Endpoints::HAF,
         // HAFAH
-        "account_history_api" => Endpoints::HAFAH,
-        "account_history_api.get_ops_in_block" => Endpoints::HAFAH,
-        "account_history_api.enum_virtual_ops" => Endpoints::HAFAH,
-        "account_history_api.get_transaction" => Endpoints::HAFAH,
-        "account_history_api.get_account_history" => Endpoints::HAFAH,
+        _ if method.starts_with("account_history_api.") => Endpoints::HAFAH,
         "condenser_api.get_ops_in_block" => Endpoints::HAFAH,
         "condenser_api.get_transaction" => Endpoints::HAFAH,
         "condenser_api.get_account_history" => Endpoints::HAFAH,
         "database_api.get_account_history" => Endpoints::HAFAH,
-        // HIVEMIND
+        // HIVEMIND 
+        _hive_endpoint if method.starts_with("hive.") => Endpoints::HIVEMIND,
         "condenser_api.get_content_replies" => Endpoints::HIVEMIND,
         "condenser_api.get_account_votes" => Endpoints::HIVEMIND,
         "condenser_api.get_followers" => Endpoints::HIVEMIND,
@@ -143,6 +159,7 @@ async fn handle_request(
         "condenser_api.get_comment_discussions_by_payout" => Endpoints::HIVEMIND,
         "condenser_api.get_replies_by_last_update" => Endpoints::HIVEMIND,
         "condenser_api.get_reblogged_by" => Endpoints::HIVEMIND,
+        _bridge_endpoint if method.starts_with("bridge.") => Endpoints::HIVEMIND,
         "follow_api" => Endpoints::HIVEMIND,
         "tags_api" => Endpoints::HIVEMIND,
         _anything_else => Endpoints::HAF,
@@ -172,7 +189,7 @@ async fn handle_request(
             return Err(ErrorStructure {
                 code: 1000,
                 message: format!("Unable to send request to endpoint."),
-                error: err.to_string(),
+                error: ErrorField::Message(err.to_string()),
             })
         }
     };
@@ -182,7 +199,7 @@ async fn handle_request(
             return Err(ErrorStructure {
                 code: 2000,
                 message: format!("Received an invalid response from the endpoint."),
-                error: err.to_string(),
+                error: ErrorField::Message(err.to_string()),
             })
         }
     };
@@ -192,17 +209,24 @@ async fn handle_request(
             return Err(ErrorStructure {
                 code: 3000,
                 message: format!("Unable to parse endpoint data."),
-                error: err.to_string(),
+                error: ErrorField::Message(err.to_string()),
             })
         }
     };
+    if json_body["error"].is_object() {
+        return Err(ErrorStructure {
+            code: 4000,
+            message: format!("Endpoint returned an error."),
+            error: ErrorField::Object(json_body["error"].clone()),
+        });
+    }
     if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
         || json_body["result"].is_null()
     {
         return Err(ErrorStructure {
             code: 4000,
             message: format!("Unable to parse endpoint data."),
-            error: "The endpoint returned an empty result.".to_string(),
+            error: ErrorField::Message("The endpoint returned an empty result.".to_string()),
         });
     }
 
@@ -237,9 +261,9 @@ async fn api_call(
         Ok(ip) => ip,
         Err(_) => {
             return HttpResponse::InternalServerError().json(ErrorStructure {
-                code: 9999,
+                code: -32000,
                 message: "Internal Server Error".to_string(),
-                error: "Invalid Cloudflare Proxy Header.".to_string(),
+                error: ErrorField::Message("Invalid Cloudflare Proxy Header.".to_string()),
             })
         }
     };
@@ -339,7 +363,7 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::JsonConfig::default()
             .content_type(|_| true)
-            .limit(512))
+            .limit(1024))
             .app_data(_cache.clone())
             .route("/", web::get().to(index))
             .route("/", web::post().to(api_call))
