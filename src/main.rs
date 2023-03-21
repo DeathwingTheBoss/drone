@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use serde_with::{serde_as, DurationSeconds};
 use std::{sync::Mutex, time::Duration};
+use actix_cors::Cors;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -359,6 +360,9 @@ async fn main() -> std::io::Result<()> {
         config: config.clone(),
     });
     println!("Drone is running on port {}.", config.port);
+    Cors::default()
+    .allow_any_origin()
+    .allowed_methods(vec!["GET", "POST"]);
     HttpServer::new(move || {
         App::new()
             .app_data(web::JsonConfig::default()
