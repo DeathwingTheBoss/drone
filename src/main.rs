@@ -89,9 +89,9 @@ enum Endpoints {
 }
 
 struct APICallResponse {
-    id: u32,
     jsonrpc: String,
     result: Value,
+    id: u32,
     cached: bool,
 }
 
