@@ -275,9 +275,9 @@ async fn api_call(
                     .insert_header(("Drone-Version", DRONE_VERSION))
                     .insert_header(("Cache-Status", response.cached.to_string()))
                     .json(serde_json::json!({
-                        "id": response.id,
                         "jsonrpc": response.jsonrpc,
                         "result": response.result,
+                        "id": response.id,
                     })),
                 Err(err) => HttpResponse::InternalServerError().json(err),
             }
