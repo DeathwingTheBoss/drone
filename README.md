@@ -46,6 +46,7 @@ OPERATOR_MESSAGE: Customizable message from the operator (default: "Drone by Dea
 HAF_ENDPOINT: HAF Endpoint that Drone can connect to relay HAF related API calls.
 HAFAH_ENDPOINT: HAFAH Endpoint that Drone can connect to relay HAFAH related API calls.
 HIVEMIND_ENDPOINT: Hivemind Endpoint that Drone can connect to relay Hivemind related API calls.
+ACTIX_CONNECTION_THREADS: Specifies the number of HTTP connections kept alive (default: 8).
 ```
 
 ## Usage

@@ -171,9 +171,9 @@ async fn handle_request(
         // build result with data from cache and response
         let result = cached_call.clone();
         return Ok(APICallResponse {
-            id: request.id,
             jsonrpc: request.jsonrpc.clone(),
             result: result["result"].clone(),
+            id: request.id,
             cached: true,
         });
     }
@@ -208,7 +208,7 @@ async fn handle_request(
         Ok(parsed) => parsed,
         Err(err) => {
             return Err(ErrorStructure {
-                code: 3000,
+                code: -32602,
                 message: format!("Unable to parse endpoint data."),
                 error: ErrorField::Message(err.to_string()),
             })
@@ -216,7 +216,7 @@ async fn handle_request(
     };
     if json_body["error"].is_object() {
         return Err(ErrorStructure {
-            code: -32602,
+            code: -32700,
             message: format!("Endpoint returned an error."),
             error: ErrorField::Object(json_body["error"].clone()),
         });
@@ -236,9 +236,9 @@ async fn handle_request(
             .insert(request.params.to_string(), json_body.clone());
     }
     Ok(APICallResponse {
-        id: request.id,
         jsonrpc: request.jsonrpc.clone(),
         result: json_body["result"].clone(),
+        id: request.id,
         cached: false,
     })
 }
@@ -288,8 +288,8 @@ async fn api_call(
             if requests.len() > 100 {
                 return HttpResponse::InternalServerError().json(ErrorStructure {
                     code: -32600,
-                    message: "Internal Server Error".to_string(),
-                    error: ErrorField::Message("Batch size too large.".to_string()),
+                    message: "Request parameter error.".to_string(),
+                    error: ErrorField::Message("Batch size too large, maximum allowed is 100.".to_string()),
                 });
             }
             
@@ -307,9 +307,9 @@ async fn api_call(
                     cached = false;
                 }
                 result.push(serde_json::json!({
-                    "id": response.id,
                     "jsonrpc": response.jsonrpc,
                     "result": response.result,
+                    "id": response.id,
                 }));
             }
             HttpResponse::Ok()
