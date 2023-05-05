@@ -1,3 +1,4 @@
+use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use config::Config;
 use lru_time_cache::LruCache;
@@ -6,7 +7,6 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use serde_with::{serde_as, DurationSeconds};
 use std::{sync::Mutex, time::Duration};
-use actix_cors::Cors;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -57,7 +57,7 @@ struct APIRequest {
 
 #[derive(Debug, Deserialize)]
 enum ErrorField {
-    Object(Value), // JSON from Hived
+    Object(Value),   // JSON from Hived
     Message(String), // Custom message
 }
 
@@ -135,7 +135,7 @@ async fn handle_request(
         "condenser_api.get_transaction" => Endpoints::HAFAH,
         "condenser_api.get_account_history" => Endpoints::HAFAH,
         "database_api.get_account_history" => Endpoints::HAFAH,
-        // HIVEMIND 
+        // HIVEMIND
         _hive_endpoint if method.starts_with("hive.") => Endpoints::HIVEMIND,
         "condenser_api.get_content_replies" => Endpoints::HIVEMIND,
         "condenser_api.get_account_votes" => Endpoints::HIVEMIND,
@@ -223,8 +223,9 @@ async fn handle_request(
     }
     let mut cacheable = true;
     if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
-    || json_body["result"].is_null() || json_body["result"]["blocks"].is_array() && 
-    json_body["result"]["blocks"].as_array().unwrap().is_empty()
+        || json_body["result"].is_null()
+        || json_body["result"]["blocks"].is_array()
+            && json_body["result"]["blocks"].as_array().unwrap().is_empty()
     {
         cacheable = false;
     }
@@ -248,7 +249,6 @@ async fn api_call(
     call: web::Json<APICall>,
     data: web::Data<AppData>,
 ) -> impl Responder {
-
     // Log the request, if there's Cloudflare header (CF-Connecting-IP) use that instead of peer_addr.
     let get_cloudflare_ip = req.headers().get("CF-Connecting-IP");
 
@@ -289,10 +289,12 @@ async fn api_call(
                 return HttpResponse::InternalServerError().json(ErrorStructure {
                     code: -32600,
                     message: "Request parameter error.".to_string(),
-                    error: ErrorField::Message("Batch size too large, maximum allowed is 100.".to_string()),
+                    error: ErrorField::Message(
+                        "Batch size too large, maximum allowed is 100.".to_string(),
+                    ),
                 });
             }
-            
+
             for request in requests {
                 let result = handle_request(&request, &data, &user_ip).await;
                 match result {
@@ -339,7 +341,7 @@ struct DroneConfig {
     haf_endpoint: String,
     hafah_endpoint: String,
     hivemind_endpoint: String,
-    actix_connection_threads: usize,
+    middleware_connection_threads: usize,
 }
 
 #[actix_web::main]
@@ -361,7 +363,7 @@ async fn main() -> std::io::Result<()> {
             ),
         ),
         webclient: ClientBuilder::new()
-            .pool_max_idle_per_host(config.actix_connection_threads)
+            .pool_max_idle_per_host(config.middleware_connection_threads)
             .build()
             .unwrap(),
         config: config.clone(),
@@ -371,10 +373,12 @@ async fn main() -> std::io::Result<()> {
         let cors = Cors::permissive();
         App::new()
             .wrap(cors)
-            .app_data(web::JsonConfig::default()
-            .content_type(|_| true)
-            .content_type_required(false)
-            .limit(1024 * 100)) // 100kb
+            .app_data(
+                web::JsonConfig::default()
+                    .content_type(|_| true)
+                    .content_type_required(false)
+                    .limit(1024 * 100),
+            ) // 100kb
             .app_data(_cache.clone())
             .route("/", web::get().to(index))
             .route("/", web::post().to(api_call))
