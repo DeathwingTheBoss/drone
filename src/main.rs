@@ -161,8 +161,6 @@ async fn handle_request(
         "condenser_api.get_replies_by_last_update" => Endpoints::HIVEMIND,
         "condenser_api.get_reblogged_by" => Endpoints::HIVEMIND,
         _bridge_endpoint if method.starts_with("bridge.") => Endpoints::HIVEMIND,
-        "follow_api" => Endpoints::HIVEMIND,
-        "tags_api" => Endpoints::HIVEMIND,
         _anything_else => Endpoints::HAF,
     };
 
@@ -249,7 +247,6 @@ async fn api_call(
     call: web::Json<APICall>,
     data: web::Data<AppData>,
 ) -> impl Responder {
-    // Log the request, if there's Cloudflare header (CF-Connecting-IP) use that instead of peer_addr.
     let get_cloudflare_ip = req.headers().get("CF-Connecting-IP");
 
     let client_ip = match get_cloudflare_ip {
@@ -284,7 +281,6 @@ async fn api_call(
         }
         APICall::Batch(requests) => {
             let mut responses = Vec::new();
-            // If there's over 100 in the batch, return an error.
             if requests.len() > 100 {
                 return HttpResponse::InternalServerError().json(ErrorStructure {
                     code: -32600,
