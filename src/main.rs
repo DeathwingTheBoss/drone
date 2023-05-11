@@ -52,7 +52,12 @@ struct APIRequest {
     jsonrpc: String,
     id: u32,
     method: String,
+    #[serde(default = "default_params")]
     params: Value,
+}
+
+fn default_params() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 #[derive(Debug, Deserialize)]
