@@ -81,6 +81,8 @@ impl Serialize for ErrorField {
 // Structure for the error response.
 #[derive(Serialize, Deserialize, Debug)]
 struct ErrorStructure {
+    jsonrpc: String,
+    id: u32,
     code: i32,
     message: String,
     error: ErrorField,
@@ -166,6 +168,8 @@ async fn handle_request(
         "condenser_api.get_replies_by_last_update" => Endpoints::HIVEMIND,
         "condenser_api.get_reblogged_by" => Endpoints::HIVEMIND,
         _bridge_endpoint if method.starts_with("bridge.") => Endpoints::HIVEMIND,
+        _follow_api_endpoint if method.starts_with("follow_api.") => Endpoints::HIVEMIND, // Remove when beem is updated. (Deprecated)
+        _tags_api_endpoint if method.starts_with("tags_api.") => Endpoints::HIVEMIND, // Remove when beem is updated. (Deprecated)
         _anything_else => Endpoints::HAF,
     };
 
@@ -191,6 +195,8 @@ async fn handle_request(
         Ok(response) => response,
         Err(err) => {
             return Err(ErrorStructure {
+                jsonrpc: request.jsonrpc.clone(),
+                id : request.id,
                 code: -32700,
                 message: format!("Unable to send request to endpoint."),
                 error: ErrorField::Message(err.to_string()),
@@ -201,6 +207,8 @@ async fn handle_request(
         Ok(text) => text,
         Err(err) => {
             return Err(ErrorStructure {
+                jsonrpc: request.jsonrpc.clone(),
+                id : request.id,
                 code: -32600,
                 message: format!("Received an invalid response from the endpoint."),
                 error: ErrorField::Message(err.to_string()),
@@ -211,6 +219,8 @@ async fn handle_request(
         Ok(parsed) => parsed,
         Err(err) => {
             return Err(ErrorStructure {
+                jsonrpc: request.jsonrpc.clone(),
+                id : request.id,
                 code: -32602,
                 message: format!("Unable to parse endpoint data."),
                 error: ErrorField::Message(err.to_string()),
@@ -219,6 +229,8 @@ async fn handle_request(
     };
     if json_body["error"].is_object() {
         return Err(ErrorStructure {
+            jsonrpc: request.jsonrpc.clone(),
+            id : request.id,
             code: -32700,
             message: format!("Endpoint returned an error."),
             error: ErrorField::Object(json_body["error"].clone()),
@@ -262,6 +274,8 @@ async fn api_call(
         Ok(ip) => ip,
         Err(_) => {
             return HttpResponse::InternalServerError().json(ErrorStructure {
+                jsonrpc: "2.0".to_string(),
+                id: 0,
                 code: -32000,
                 message: "Internal Server Error".to_string(),
                 error: ErrorField::Message("Invalid Cloudflare Proxy Header.".to_string()),
@@ -288,6 +302,8 @@ async fn api_call(
             let mut responses = Vec::new();
             if requests.len() > 100 {
                 return HttpResponse::InternalServerError().json(ErrorStructure {
+                    jsonrpc: "2.0".to_string(),
+                    id: 0,
                     code: -32600,
                     message: "Request parameter error.".to_string(),
                     error: ErrorField::Message(
