@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:bullseye as builder
 
 WORKDIR /drone
 
