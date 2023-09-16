@@ -1,5 +1,6 @@
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use async_recursion::async_recursion;
 use config::Config;
 use lru_time_cache::LruCache;
 use reqwest::{Client, ClientBuilder};
@@ -113,6 +114,7 @@ impl Endpoints {
     }
 }
 
+#[async_recursion]
 async fn handle_request(
     request: &APIRequest,
     data: &web::Data<AppData>,
@@ -120,7 +122,25 @@ async fn handle_request(
 ) -> Result<APICallResponse, ErrorStructure> {
     // Convert the call to a struct.
     let client = data.webclient.clone();
-    // If there's a single call, just forward it.
+    let method = request.method.as_str();
+
+    if method == "call" {
+        if let Some(params) = request.params.as_array() {
+            if params.len() > 2 {
+                if let Some(method) = params[0].as_str() {
+                    let format_new_method = format!("{}.{}", method, params[1].as_str().unwrap());
+                    let new_params = params[2].clone();
+                    let new_request = APIRequest {
+                        jsonrpc: "2.0".to_string(),
+                        id: request.id,
+                        method: format_new_method,
+                        params: new_params,
+                    };
+                    return handle_request(&new_request, data, client_ip).await;
+                }
+            }
+        }
+    }
 
     // Get humantime for logging.
     let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
@@ -129,7 +149,8 @@ async fn handle_request(
         human_timestamp, client_ip, request.method, request.params,
     );
     println!("{}", formatted_log);
-    let method = request.method.as_str();
+
+
     // Pick the endpoints depending on the method.
     let endpoints = match method {
         // HAF
@@ -167,6 +188,7 @@ async fn handle_request(
         "condenser_api.get_comment_discussions_by_payout" => Endpoints::HIVEMIND,
         "condenser_api.get_replies_by_last_update" => Endpoints::HIVEMIND,
         "condenser_api.get_reblogged_by" => Endpoints::HIVEMIND,
+        "database_api.find_comments" => Endpoints::HIVEMIND,
         _bridge_endpoint if method.starts_with("bridge.") => Endpoints::HIVEMIND,
         _follow_api_endpoint if method.starts_with("follow_api.") => Endpoints::HIVEMIND, // Remove when beem is updated. (Deprecated)
         _tags_api_endpoint if method.starts_with("tags_api.") => Endpoints::HIVEMIND, // Remove when beem is updated. (Deprecated)
