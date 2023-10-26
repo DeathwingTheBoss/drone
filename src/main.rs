@@ -53,12 +53,8 @@ struct APIRequest {
     jsonrpc: String,
     id: u32,
     method: String,
-    #[serde(default = "default_params")]
-    params: Value,
-}
-
-fn default_params() -> Value {
-    Value::Object(serde_json::Map::new())
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,7 +121,7 @@ async fn handle_request(
     let method = request.method.as_str();
 
     if method == "call" {
-        if let Some(params) = request.params.as_array() {
+        if let Some(params) = request.params.as_ref().and_then(Value::as_array) {
             if params.len() > 2 {
                 if let Some(method) = params[0].as_str() {
                     let format_new_method = format!("{}.{}", method, params[1].as_str().unwrap());
@@ -134,7 +130,7 @@ async fn handle_request(
                         jsonrpc: "2.0".to_string(),
                         id: request.id,
                         method: format_new_method,
-                        params: new_params,
+                        params: Some(new_params),
                     };
                     return handle_request(&new_request, data, client_ip).await;
                 }
@@ -144,10 +140,17 @@ async fn handle_request(
 
     // Get humantime for logging.
     let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
-    let formatted_log = format!(
-        "Timestamp: {} || IP: {} || Request Method: {} || Request Params: {}",
-        human_timestamp, client_ip, request.method, request.params,
-    );
+    let formatted_log = if let Some(params) = &request.params {
+        format!(
+            "Timestamp: {} || IP: {} || Request Method: {} || Request Params: {}",
+            human_timestamp, client_ip, request.method, params,
+        )
+    } else {
+        format!(
+            "Timestamp: {} || IP: {} || Request Method: {}",
+            human_timestamp, client_ip, request.method,
+        )
+    };
     println!("{}", formatted_log);
 
 
@@ -195,8 +198,9 @@ async fn handle_request(
         _anything_else => Endpoints::HAF,
     };
 
-    // Check if the call is in the cache. If it is, return only the result while keeping rest of the response the same.
-    if let Some(cached_call) = data.cache.lock().unwrap().get(&request.params.to_string()) {
+    // Check if the call is in the cache. If it is, return only the result while keeping the rest of the response the same.
+    let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
+    if let Some(cached_call) = data.cache.lock().unwrap().get(&params_str) {
         // build result with data from cache and response
         let result = cached_call.clone();
         return Ok(APICallResponse {
@@ -206,6 +210,7 @@ async fn handle_request(
             cached: true,
         });
     }
+
 
     // Send the request to the endpoints.
     let res = match client
@@ -268,10 +273,11 @@ async fn handle_request(
     }
 
     if DRONE_CACHEABLE_METHODS.contains(&request.method.as_str()) && cacheable {
+        let params_str = request.params.as_ref().map_or("[]".to_string(), |v| v.to_string());
         data.cache
             .lock()
             .unwrap()
-            .insert(request.params.to_string(), json_body.clone());
+            .insert(params_str, json_body.clone());
     }
     Ok(APICallResponse {
         jsonrpc: request.jsonrpc.clone(),
