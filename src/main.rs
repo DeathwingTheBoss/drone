@@ -7,7 +7,7 @@ use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use serde_with::{serde_as, DurationSeconds};
-use std::{sync::Mutex, time::Duration};
+use std::{sync::Mutex, time::Duration, fmt::Display};
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -106,6 +106,16 @@ impl Endpoints {
             Endpoints::HAF => appdata.config.haf_endpoint.as_str(),
             Endpoints::HAFAH => appdata.config.hafah_endpoint.as_str(),
             Endpoints::HIVEMIND => appdata.config.hivemind_endpoint.as_str(),
+        }
+    }
+}
+
+impl Display for Endpoints {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Endpoints::HAF => write!(f, " Endpoint: HAF"),
+            Endpoints::HAFAH => write!(f, " Endpoint: HAFAH"),
+            Endpoints::HIVEMIND => write!(f, " Endpoint: HIVEMIND"),
         }
     }
 }
@@ -221,12 +231,14 @@ async fn handle_request(
     {
         Ok(response) => response,
         Err(err) => {
+            let mut error_message = err.without_url().to_string();
+            error_message.push_str(&endpoints.to_string());
             return Err(ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
                 id : request.id,
                 code: -32700,
                 message: format!("Unable to send request to endpoint."),
-                error: ErrorField::Message(err.to_string()),
+                error: ErrorField::Message(error_message),
             })
         }
     };

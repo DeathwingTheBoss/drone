@@ -1,6 +1,6 @@
 [package]
 name = "drone"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 authors = ["Deathwing <hi@deathwing.me>"]
 description = "A caching reverse-proxy application for the Hive blockchain."
