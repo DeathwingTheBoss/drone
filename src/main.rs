@@ -47,11 +47,20 @@ enum APICall {
     Batch(Vec<APIRequest>),
 }
 
+// Enum for id in JSONRPC body.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+enum ID {
+    Str(String),
+    Int(u32),
+}
+
+
 // Structure for API calls.
 #[derive(Serialize, Deserialize, Debug)]
 struct APIRequest {
     jsonrpc: String,
-    id: String,
+    id: ID,
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<Value>,
@@ -79,7 +88,7 @@ impl Serialize for ErrorField {
 #[derive(Serialize, Deserialize, Debug)]
 struct ErrorStructure {
     jsonrpc: String,
-    id: String,
+    id: ID,
     code: i32,
     message: String,
     error: ErrorField,
@@ -95,7 +104,7 @@ enum Endpoints {
 struct APICallResponse {
     jsonrpc: String,
     result: Value,
-    id: String,
+    id: ID,
     cached: bool,
 }
 
@@ -315,7 +324,7 @@ async fn api_call(
         Err(_) => {
             return HttpResponse::InternalServerError().json(ErrorStructure {
                 jsonrpc: "2.0".to_string(),
-                id: "0".to_string(),
+                id: ID::Int(0),
                 code: -32000,
                 message: "Internal Server Error".to_string(),
                 error: ErrorField::Message("Invalid Cloudflare Proxy Header.".to_string()),
@@ -343,7 +352,7 @@ async fn api_call(
             if requests.len() > 100 {
                 return HttpResponse::InternalServerError().json(ErrorStructure {
                     jsonrpc: "2.0".to_string(),
-                    id: "0".to_string(),
+                    id: ID::Int(0),
                     code: -32600,
                     message: "Request parameter error.".to_string(),
                     error: ErrorField::Message(
