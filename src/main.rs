@@ -51,7 +51,7 @@ enum APICall {
 #[derive(Serialize, Deserialize, Debug)]
 struct APIRequest {
     jsonrpc: String,
-    id: u32,
+    id: String,
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<Value>,
@@ -79,7 +79,7 @@ impl Serialize for ErrorField {
 #[derive(Serialize, Deserialize, Debug)]
 struct ErrorStructure {
     jsonrpc: String,
-    id: u32,
+    id: String,
     code: i32,
     message: String,
     error: ErrorField,
@@ -95,7 +95,7 @@ enum Endpoints {
 struct APICallResponse {
     jsonrpc: String,
     result: Value,
-    id: u32,
+    id: String,
     cached: bool,
 }
 
@@ -138,7 +138,7 @@ async fn handle_request(
                     let new_params = params[2].clone();
                     let new_request = APIRequest {
                         jsonrpc: "2.0".to_string(),
-                        id: request.id,
+                        id: request.id.clone(),
                         method: format_new_method,
                         params: Some(new_params),
                     };
@@ -216,7 +216,7 @@ async fn handle_request(
         return Ok(APICallResponse {
             jsonrpc: request.jsonrpc.clone(),
             result: result["result"].clone(),
-            id: request.id,
+            id: request.id.clone(),
             cached: true,
         });
     }
@@ -235,7 +235,7 @@ async fn handle_request(
             error_message.push_str(&endpoints.to_string());
             return Err(ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
-                id : request.id,
+                id : request.id.clone(),
                 code: -32700,
                 message: format!("Unable to send request to endpoint."),
                 error: ErrorField::Message(error_message),
@@ -247,7 +247,7 @@ async fn handle_request(
         Err(err) => {
             return Err(ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
-                id : request.id,
+                id : request.id.clone(),
                 code: -32600,
                 message: format!("Received an invalid response from the endpoint."),
                 error: ErrorField::Message(err.to_string()),
@@ -259,7 +259,7 @@ async fn handle_request(
         Err(err) => {
             return Err(ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
-                id : request.id,
+                id : request.id.clone(),
                 code: -32602,
                 message: format!("Unable to parse endpoint data."),
                 error: ErrorField::Message(err.to_string()),
@@ -269,7 +269,7 @@ async fn handle_request(
     if json_body["error"].is_object() {
         return Err(ErrorStructure {
             jsonrpc: request.jsonrpc.clone(),
-            id : request.id,
+            id : request.id.clone(),
             code: -32700,
             message: format!("Endpoint returned an error."),
             error: ErrorField::Object(json_body["error"].clone()),
@@ -294,7 +294,7 @@ async fn handle_request(
     Ok(APICallResponse {
         jsonrpc: request.jsonrpc.clone(),
         result: json_body["result"].clone(),
-        id: request.id,
+        id: request.id.clone(),
         cached: false,
     })
 }
@@ -315,7 +315,7 @@ async fn api_call(
         Err(_) => {
             return HttpResponse::InternalServerError().json(ErrorStructure {
                 jsonrpc: "2.0".to_string(),
-                id: 0,
+                id: "0".to_string(),
                 code: -32000,
                 message: "Internal Server Error".to_string(),
                 error: ErrorField::Message("Invalid Cloudflare Proxy Header.".to_string()),
@@ -343,7 +343,7 @@ async fn api_call(
             if requests.len() > 100 {
                 return HttpResponse::InternalServerError().json(ErrorStructure {
                     jsonrpc: "2.0".to_string(),
-                    id: 0,
+                    id: "0".to_string(),
                     code: -32600,
                     message: "Request parameter error.".to_string(),
                     error: ErrorField::Message(
