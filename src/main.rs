@@ -2,7 +2,7 @@ use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use async_recursion::async_recursion;
 use config::Config;
-use lru_time_cache::LruCache;
+use moka::sync::Cache;
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
@@ -219,7 +219,7 @@ async fn handle_request(
 
     // Check if the call is in the cache. If it is, return only the result while keeping the rest of the response the same.
     let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
-    if let Some(cached_call) = data.cache.lock().unwrap().get(&params_str) {
+    if let Some(cached_call) = data.cache.get(&params_str) {
         // build result with data from cache and response
         let result = cached_call.clone();
         return Ok(APICallResponse {
@@ -295,10 +295,7 @@ async fn handle_request(
 
     if DRONE_CACHEABLE_METHODS.contains(&request.method.as_str()) && cacheable {
         let params_str = request.params.as_ref().map_or("[]".to_string(), |v| v.to_string());
-        data.cache
-            .lock()
-            .unwrap()
-            .insert(params_str, json_body.clone());
+        data.cache.insert(params_str, json_body.clone());
     }
     Ok(APICallResponse {
         jsonrpc: request.jsonrpc.clone(),
@@ -389,7 +386,7 @@ async fn api_call(
 }
 
 struct AppData {
-    cache: Mutex<LruCache<String, Value>>,
+    cache: Cache<String, Value>,
     webclient: Client,
     config: DroneConfig,
 }
@@ -402,7 +399,7 @@ struct DroneConfig {
     hostname: String,
     #[serde_as(as = "DurationSeconds<u64>")]
     cache_ttl: Duration,
-    cache_count: usize,
+    cache_count: u64,
     operator_message: String,
     haf_endpoint: String,
     hafah_endpoint: String,
@@ -422,12 +419,10 @@ async fn main() -> std::io::Result<()> {
 
     // Create the cache.
     let _cache = web::Data::new(AppData {
-        cache: Mutex::new(
-            LruCache::<String, serde_json::Value>::with_expiry_duration_and_capacity(
-                config.cache_ttl,
-                config.cache_count,
-            ),
-        ),
+        cache: Cache::builder()
+            .max_capacity(config.cache_count)
+            .time_to_live(config.cache_ttl)
+            .build(),
         webclient: ClientBuilder::new()
             .pool_max_idle_per_host(config.middleware_connection_threads)
             .build()
