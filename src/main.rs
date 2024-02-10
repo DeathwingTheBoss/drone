@@ -1,26 +1,33 @@
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
-use async_recursion::async_recursion;
-use config::Config;
-use moka::sync::Cache;
+use moka::{sync::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
-use serde_with::{serde_as, DurationSeconds};
-use std::{sync::Mutex, time::Duration, fmt::Display};
+use std::sync::{Mutex};
+use std::time::{Duration, Instant, SystemTime};
+use std::collections::{HashMap};
+use std::sync::atomic::{self, AtomicU32};
+use actix_web::rt::time::sleep;
+use futures_util::future::{FutureExt, Future,Shared};
+use std::pin::Pin;
+use std::sync::OnceLock;
+use chrono::DateTime;
+
+
+
+pub mod config;
+use config::{AppConfig, TtlValue};
+
+pub mod method_renamer;
+use method_renamer::MethodAndParams;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// Drone Cacheable Methods
-const DRONE_CACHEABLE_METHODS: [&str; 7] = [
-    "block_api.get_block",
-    "condenser_api.get_block",
-    "account_history_api.get_transaction",
-    "condenser_api.get_transaction",
-    "condenser_api.get_ops_in_block",
-    "condenser_api.get_block_range",
-    "block_api.get_block_range",
-];
+// TODO: fix these, shouldn't be static globals
+static last_irreversible_block_number: AtomicU32 = AtomicU32::new(0);
+static current_head_block_number: AtomicU32 = AtomicU32::new(0);
+
 
 #[derive(Serialize, Deserialize, Debug)]
 struct HealthCheck {
@@ -35,7 +42,7 @@ async fn index(appdata: web::Data<AppData>) -> impl Responder {
     HttpResponse::Ok().json(HealthCheck {
         status: "OK".to_string(),
         drone_version: DRONE_VERSION.to_string(),
-        message: appdata.config.operator_message.to_string(),
+        message: appdata.config.drone.operator_message.to_string(),
     })
 }
 
@@ -58,7 +65,7 @@ enum ID {
 
 // Structure for API calls.
 #[derive(Serialize, Deserialize, Debug)]
-struct APIRequest {
+pub struct APIRequest {
     jsonrpc: String,
     id: ID,
     method: String,
@@ -66,7 +73,7 @@ struct APIRequest {
     params: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 enum ErrorField {
     Object(Value),   // JSON from Hived
     Message(String), // Custom message
@@ -85,7 +92,7 @@ impl Serialize for ErrorField {
 }
 
 // Structure for the error response.
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct ErrorStructure {
     jsonrpc: String,
     id: ID,
@@ -94,154 +101,118 @@ struct ErrorStructure {
     error: ErrorField,
 }
 
-// Enum for the endpoints.
-enum Endpoints {
-    HAF,
-    HAFAH,
-    HIVEMIND,
-}
-
+#[derive(Clone)]
 struct APICallResponse {
+    /// the original value of jsonrpc request made by the caller (usually "2.0")
     jsonrpc: String,
     result: Value,
+    /// the id the caller used in their request
     id: ID,
+    // data returned just for logging/debugging
     cached: bool,
+    mapped_method: MethodAndParams, // the method, parsed and transformed
+    backend_url: Option<String>,
+    upstream_method: Option<String>
 }
 
-// Choose the endpoint depending on the method.
-impl Endpoints {
-    fn choose_endpoint<'a>(&self, appdata: &'a web::Data<AppData>) -> &'a str {
-        match self {
-            Endpoints::HAF => appdata.config.haf_endpoint.as_str(),
-            Endpoints::HAFAH => appdata.config.hafah_endpoint.as_str(),
-            Endpoints::HIVEMIND => appdata.config.hivemind_endpoint.as_str(),
-        }
+#[derive(Clone, Debug)]
+struct CacheEntry {
+    result: Value,
+    size: u32,
+	ttl: TtlValue
+}
+
+pub struct MyExpiry;
+
+impl Expiry<String, CacheEntry> for MyExpiry {
+    /// Returns the duration of the expiration of the value that was just
+    /// created.
+    fn expire_after_create(&self, key: &String, value: &CacheEntry, _current_time: Instant) -> Option<Duration> {
+		match value.ttl {
+            TtlValue::NoExpire => { None }
+			TtlValue::DurationInSeconds(s) => { 
+                println!("MyExpiry: expire_after_create called with key {key}, returning duration {s}.");
+                Some(Duration::from_secs(s as u64))
+            }
+			_ => { 
+                println!("MyExpiry: expire_after_create called with key {key} that doesn't have a duration in seconds, this is unexpected.");
+                None
+            }
+		}
     }
 }
 
-impl Display for Endpoints {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Endpoints::HAF => write!(f, " Endpoint: HAF"),
-            Endpoints::HAFAH => write!(f, " Endpoint: HAFAH"),
-            Endpoints::HIVEMIND => write!(f, " Endpoint: HIVEMIND"),
-        }
+fn get_block_number_from_result(result: &Value) -> Option<u32> {
+    // appbase get_block
+    if let Some(block_num) = result.pointer("/block/block_id").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+        return Some(block_num);
     }
+    // appbase get_block_header
+    if let Some(prev_block_num) = result.pointer("/header/previous").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+        return Some(prev_block_num + 1);
+    }
+    // hived get_block
+    if let Some(block_num) = result.pointer("/block_id").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+        return Some(block_num);
+    }
+    // hived get_block_header
+    if let Some(prev_block_num) = result.pointer("/previous").and_then(|block_id| block_id.as_str()).and_then(|id_str| u32::from_str_radix(&id_str[..8], 16).ok()) {
+        return Some(prev_block_num + 1);
+    }
+
+    None
 }
 
-#[async_recursion]
-async fn handle_request(
-    request: &APIRequest,
-    data: &web::Data<AppData>,
-    client_ip: &String,
-) -> Result<APICallResponse, ErrorStructure> {
-    // Convert the call to a struct.
-    let client = data.webclient.clone();
-    let method = request.method.as_str();
-
-    if method == "call" {
-        if let Some(params) = request.params.as_ref().and_then(Value::as_array) {
-            if params.len() > 2 {
-                if let Some(method) = params[0].as_str() {
-                    let format_new_method = format!("{}.{}", method, params[1].as_str().unwrap());
-                    let new_params = params[2].clone();
-                    let new_request = APIRequest {
-                        jsonrpc: "2.0".to_string(),
-                        id: request.id.clone(),
-                        method: format_new_method,
-                        params: Some(new_params),
-                    };
-                    return handle_request(&new_request, data, client_ip).await;
-                }
+// check a request to see if it's asking for a block that doesn't exist yet.  We get a lot of API
+// calls that do this, presumably clients that are just polling for the next block.
+// This is a case we can optimize.  Either by:
+// - returning a stock error reply, without contacting the upstream, or
+// - if the block is expected to arrive in a few seconds, just wait.  once the bloc arrives, return it
+// Waiting seems better
+fn check_for_future_block_requests(mapped_method: &MethodAndParams) {
+    if mapped_method.method == "get_block" {
+        if let Some(block_num) = mapped_method.params.as_ref().and_then(|v| v["block_num"].as_u64()) {
+            if block_num as u32 > current_head_block_number.load(atomic::Ordering::Acquire) {
+                // we're only testing against the head block number we recorded the last
+                // time someone called get_dynamic_global_properties.
+                // we should also check that now() is < the predicted time the requested
+                // block will be produced
+                println!("future block requested: {block_num}, head is {}", current_head_block_number.load(atomic::Ordering::Acquire));
             }
         }
     }
+}
 
-    // Get humantime for logging.
-    let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
-    let formatted_log = if let Some(params) = &request.params {
-        format!(
-            "Timestamp: {} || IP: {} || Request Method: {} || Request Params: {}",
-            human_timestamp, client_ip, request.method, params,
-        )
-    } else {
-        format!(
-            "Timestamp: {} || IP: {} || Request Method: {}",
-            human_timestamp, client_ip, request.method,
-        )
-    };
-    println!("{}", formatted_log);
-
-
-    // Pick the endpoints depending on the method.
-    let endpoints = match method {
-        // HAF
-        "condenser_api.get_block" => Endpoints::HAF,
-        "block_api.get_block_range" => Endpoints::HAF,
-        "condenser_api.get_block_range" => Endpoints::HAF,
-        // HAFAH
-        _ if method.starts_with("account_history_api.") => Endpoints::HAFAH,
-        "condenser_api.get_ops_in_block" => Endpoints::HAFAH,
-        "condenser_api.get_transaction" => Endpoints::HAFAH,
-        "condenser_api.get_account_history" => Endpoints::HAFAH,
-        "database_api.get_account_history" => Endpoints::HAFAH,
-        // HIVEMIND
-        _hive_endpoint if method.starts_with("hive.") => Endpoints::HIVEMIND,
-        "condenser_api.get_content_replies" => Endpoints::HIVEMIND,
-        "condenser_api.get_account_votes" => Endpoints::HIVEMIND,
-        "condenser_api.get_followers" => Endpoints::HIVEMIND,
-        "condenser_api.get_following" => Endpoints::HIVEMIND,
-        "condenser_api.get_follow_count" => Endpoints::HIVEMIND,
-        "condenser_api.get_blog" => Endpoints::HIVEMIND,
-        "condenser_api.get_content" => Endpoints::HIVEMIND,
-        "condenser_api.get_blog_entries" => Endpoints::HIVEMIND,
-        "condenser_api.get_active_votes" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_trending" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_hot" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_promoted" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_created" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_blog" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_feed" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_comments" => Endpoints::HIVEMIND,
-        "condenser_api.get_discussions_by_author_before_date" => Endpoints::HIVEMIND,
-        "condenser_api.get_state" => Endpoints::HIVEMIND,
-        "condenser_api.get_trending_tags" => Endpoints::HIVEMIND,
-        "condenser_api.get_post_discussions_by_payout" => Endpoints::HIVEMIND,
-        "condenser_api.get_comment_discussions_by_payout" => Endpoints::HIVEMIND,
-        "condenser_api.get_replies_by_last_update" => Endpoints::HIVEMIND,
-        "condenser_api.get_reblogged_by" => Endpoints::HIVEMIND,
-        "database_api.find_comments" => Endpoints::HIVEMIND,
-        _bridge_endpoint if method.starts_with("bridge.") => Endpoints::HIVEMIND,
-        _follow_api_endpoint if method.starts_with("follow_api.") => Endpoints::HIVEMIND, // Remove when beem is updated. (Deprecated)
-        _tags_api_endpoint if method.starts_with("tags_api.") => Endpoints::HIVEMIND, // Remove when beem is updated. (Deprecated)
-        _anything_else => Endpoints::HAF,
+async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String) -> Result<APICallResponse, ErrorStructure> {
+    let endpoint = match data.config.lookup_url(mapped_method.get_method_name_parts()) {
+        Some(endpoint) => { endpoint }
+        None => {
+            return Err(ErrorStructure {
+                jsonrpc: request.jsonrpc.clone(),
+                id : request.id.clone(),
+                code: -32700,
+                message: format!("Unable to map request to endpoint."),
+                error: ErrorField::Message("Unable to map request to endpoint.".to_string()),
+            });
+        }
     };
 
-    // Check if the call is in the cache. If it is, return only the result while keeping the rest of the response the same.
-    let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
-    if let Some(cached_call) = data.cache.get(&params_str) {
-        // build result with data from cache and response
-        let result = cached_call.clone();
-        return Ok(APICallResponse {
-            jsonrpc: request.jsonrpc.clone(),
-            result: result["result"].clone(),
-            id: request.id.clone(),
-            cached: true,
-        });
-    }
+    let upstream_request = mapped_method.format_for_upstream(&data.config);
+    println!("Making upstream request using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
+    let client = data.webclient.clone();
 
     // Send the request to the endpoints.
     let res = match client
-        .post(endpoints.choose_endpoint(&data))
-        .json(&request)
+        .post(endpoint)
+        .json(&upstream_request)
         .send()
         .await
     {
         Ok(response) => response,
         Err(err) => {
             let mut error_message = err.without_url().to_string();
-            error_message.push_str(&endpoints.to_string());
+            error_message.push_str(&endpoint.to_string());
             return Err(ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
                 id : request.id.clone(),
@@ -251,6 +222,10 @@ async fn handle_request(
             })
         }
     };
+
+    // to simulate slow calls, put a sleep here
+    // sleep(Duration::from_secs(10)).await;
+
     let body = match res.text().await {
         Ok(text) => text,
         Err(err) => {
@@ -284,25 +259,157 @@ async fn handle_request(
             error: ErrorField::Object(json_body["error"].clone()),
         });
     }
-    let mut cacheable = true;
-    if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
-        || json_body["result"].is_null()
-        || json_body["result"]["blocks"].is_array()
-            && json_body["result"]["blocks"].as_array().unwrap().is_empty()
-    {
-        cacheable = false;
+
+    // if the call was to get_dynamic_global_properties, save off the last irreversible block
+    println!("Mapped method is {}", mapped_method.method);
+    if mapped_method.method == "get_dynamic_global_properties" {
+        println!("This method was get_dynamic_global_properties");
+        if let Some(new_lib) = json_body["result"]["last_irreversible_block_num"].as_u64() {
+            if new_lib as u32 > last_irreversible_block_number.load(atomic::Ordering::Acquire) {
+                println!("new LIB is {new_lib}");
+                last_irreversible_block_number.store(new_lib as u32, atomic::Ordering::Release);
+            }
+        }
+        if let Some(new_head) = json_body["result"]["head_block_number"].as_u64() {
+            if new_head as u32 > current_head_block_number.load(atomic::Ordering::Acquire) {
+                println!("new head is {new_head}");
+                current_head_block_number.store(new_head as u32, atomic::Ordering::Release);
+                if let Some(new_time) = json_body["result"]["time"].as_str() {
+                    let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
+                    let systemtime = SystemTime::from(current_head_block_time);
+                    println!("Parsed datetime to {:?}, as systemtime: {:?}", current_head_block_time, systemtime);
+                }
+            }
+        }
     }
 
-    if DRONE_CACHEABLE_METHODS.contains(&request.method.as_str()) && cacheable {
-        let params_str = request.params.as_ref().map_or("[]".to_string(), |v| v.to_string());
-        data.cache.insert(params_str, json_body.clone());
+
+    if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
+        || json_body["result"].is_null()
+        || json_body["result"]["blocks"].is_array() && json_body["result"]["blocks"].as_array().unwrap().is_empty()
+    {
+        // then this result shouldn't be cached
+        // TODO: why?
     }
+    else
+    {
+        let mut ttl = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
+        println!("Method lookup_ttl returns {ttl:?}");
+
+        if ttl == TtlValue::ExpireIfReversible {
+            // we cache forever if the block is irreversible, or 9 seconds if it's reversible
+            if let Some(block_number) = get_block_number_from_result(&json_body["result"]) {
+                ttl = if block_number > last_irreversible_block_number.load(atomic::Ordering::Acquire) { TtlValue::DurationInSeconds(9) } else { TtlValue::NoExpire };
+                println!("block number from result is {block_number}, lib is {}, setting ttl to {:?}", last_irreversible_block_number.load(atomic::Ordering::Acquire), ttl);
+            }
+        }
+        match ttl {
+            TtlValue::NoExpire | TtlValue::DurationInSeconds(_) => {
+                let entry = CacheEntry {
+                    result: json_body["result"].clone(),
+                    size: body.len() as u32,
+                    ttl
+                };
+                data.cache.insert(method_and_params_str, entry);
+            }
+            _ => {}
+        }
+    }
+
     Ok(APICallResponse {
         jsonrpc: request.jsonrpc.clone(),
         result: json_body["result"].clone(),
         id: request.id.clone(),
         cached: false,
+        mapped_method,
+        backend_url: Some(endpoint.clone()),
+        upstream_method: Some(upstream_request.method.clone())
     })
+}
+
+async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String) -> Result<APICallResponse, ErrorStructure> {
+    // perform any requested mappings, this may give us different method names & and params
+    let mapped_method = match method_renamer::map_method_name(&data.config, &request.method, &request.params) {
+        Ok(mapped_method) => { mapped_method }
+        Err(_) => {
+            return Err(ErrorStructure {
+                jsonrpc: request.jsonrpc.clone(),
+                id : request.id.clone(),
+                code: -32700,
+                message: format!("Unable to parse request method."),
+                error: ErrorField::Message("Unable to parse request method.".to_string()),
+            });
+        }
+    };
+
+    check_for_future_block_requests(&mapped_method);
+
+    // Get humantime for logging.
+    let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
+    let formatted_log = if let Some(params) = &request.params {
+        format!(
+            "Timestamp: {} || IP: {} || Request Method: {} || Request Params: {}",
+            human_timestamp, client_ip, request.method, params,
+        )
+    } else {
+        format!(
+            "Timestamp: {} || IP: {} || Request Method: {}",
+            human_timestamp, client_ip, request.method,
+        )
+    };
+    println!("{}", formatted_log);
+
+    // Check if the call is in the cache. If it is, return it
+    let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
+    let method_and_params_str = format!("{}({params_str})", mapped_method.method);
+    println!("Using cache key {method_and_params_str}");
+    if let Some(cached_call) = data.cache.get(&method_and_params_str) {
+        println!("Cache hit");
+        return Ok(APICallResponse {
+            jsonrpc: request.jsonrpc.clone(),
+            result: cached_call.result.clone(),
+            id: request.id,
+            cached: true,
+            mapped_method,
+            backend_url: None,
+            upstream_method: None
+        });
+    }
+    println!("Cache miss");
+
+    // Check and see if another thread is currently handling this call.  If it is, join them
+    let in_progress_call: InProgressCall;
+	let first_caller: bool;
+    {
+        let mut in_progress = in_progress_call_registry().lock().unwrap();
+        in_progress_call = if let Some(value) = in_progress.get_mut(&method_and_params_str) {
+			first_caller = false;
+            value.call_count += 1;
+            value.clone()
+        } else {
+			first_caller = true;
+            let upstream_request_record = InProgressCall {
+                future: request_from_upstream(request, data.clone(), mapped_method, method_and_params_str.clone()).boxed().shared(),
+                call_count: 1,
+                first_call_start_time: Instant::now()
+            };
+            in_progress.insert(method_and_params_str.clone(), upstream_request_record.clone());
+            upstream_request_record
+        }
+    }
+    if !first_caller {
+        println!("Multiple calls in progress: {method_and_params_str}: {}", in_progress_call.call_count);
+    }
+
+    let upstream_response = in_progress_call.future.await;
+
+    // one caller needs to remove the entry from the registry when the upstream call has completed.
+    // It doesn't matter who does it, so we arbitrarily decide to make it the first caller.
+	if first_caller	{
+        in_progress_call_registry().lock().unwrap().remove(&method_and_params_str);
+    }
+
+    upstream_response
 }
 
 async fn api_call(
@@ -331,11 +438,17 @@ async fn api_call(
 
     match call.0 {
         APICall::Single(request) => {
-            let result = handle_request(&request, &data, &user_ip).await;
+            let result = handle_request(request, &data, &user_ip).await;
             match result {
                 Ok(response) => HttpResponse::Ok()
                     .insert_header(("Drone-Version", DRONE_VERSION))
-                    .insert_header(("Cache-Status", response.cached.to_string()))
+                    .insert_header(("X-Jussi-Cache-Hit", response.cached.to_string()))
+                    .insert_header(("X-Jussi-Namespace", response.mapped_method.namespace))
+                    .insert_header(("X-Jussi-Api", response.mapped_method.api.unwrap_or("<Empty>".to_string())))
+                    .insert_header(("X-Jussi-Method", response.mapped_method.method))
+                    .insert_header(("X-Jussi-Params", response.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())))
+                    .insert_header(("X-Jussi-Backend-Url", response.backend_url.unwrap_or("".to_string())))
+                    .insert_header(("X-Jussi-Upstream-Method", response.upstream_method.unwrap_or("".to_string())))
                     .json(serde_json::json!({
                         "jsonrpc": response.jsonrpc,
                         "result": response.result,
@@ -359,7 +472,7 @@ async fn api_call(
             }
 
             for request in requests {
-                let result = handle_request(&request, &data, &user_ip).await;
+                let result = handle_request(request, &data, &user_ip).await;
                 match result {
                     Ok(response) => responses.push(response),
                     Err(err) => return HttpResponse::InternalServerError().json(err),
@@ -368,7 +481,7 @@ async fn api_call(
             let mut cached = true;
             let mut result = Vec::new();
             for response in responses {
-                if response.cached == false {
+                if !response.cached {
                     cached = false;
                 }
                 result.push(serde_json::json!({
@@ -385,51 +498,57 @@ async fn api_call(
     }
 }
 
-struct AppData {
-    cache: Cache<String, Value>,
-    webclient: Client,
-    config: DroneConfig,
+#[derive(Clone)]
+struct InProgressCall {
+    future: Shared<Pin<Box<dyn Future<Output = Result<APICallResponse, ErrorStructure>> + Send>>>,
+    /// the rest of this data structure is just info we track for debugging/logging,
+    /// we could omit them and Drone would work the same
+    call_count: u32,
+    first_call_start_time: Instant,
 }
 
-#[serde_as]
-#[derive(Clone, Deserialize, Debug)]
-#[serde(rename_all = "UPPERCASE")]
-struct DroneConfig {
-    port: u16,
-    hostname: String,
-    #[serde_as(as = "DurationSeconds<u64>")]
-    cache_ttl: Duration,
-    cache_count: u64,
-    operator_message: String,
-    haf_endpoint: String,
-    hafah_endpoint: String,
-    hivemind_endpoint: String,
-    middleware_connection_threads: usize,
+struct AppData {
+    cache: Cache<String, CacheEntry>,
+    webclient: Client,
+    config: AppConfig,
+}
+
+/// Singleton registry that holds futures for all currently-in-progress calls to the upstream servers,
+/// indexed by method name and parameters
+fn in_progress_call_registry() -> &'static Mutex<HashMap<String, InProgressCall>> {
+    static INSTANCE: OnceLock<Mutex<HashMap<String, InProgressCall>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Load config.
-    let config = Config::builder()
-        .add_source(config::File::with_name("config.json"))
-        .build()
-        .expect("Could not load config.json")
-        .try_deserialize::<DroneConfig>()
-        .expect("config.json is not in a valid format.");
+    let app_config = config::parse_file("config.yaml");
+
+    // helpers for the cach
+    let expiry = MyExpiry;
+    let eviction_listener = |key, _value, cause| {
+        println!("Evicted key {key}. Cause: {cause:?}");
+    };
+    let weigher = |_key: &String, value: &CacheEntry| -> u32 {
+        value.size
+    };
 
     // Create the cache.
     let _cache = web::Data::new(AppData {
         cache: Cache::builder()
-            .max_capacity(config.cache_count)
-            .time_to_live(config.cache_ttl)
+            .max_capacity(app_config.drone.cache_max_capacity)
+            .expire_after(expiry)
+            .eviction_listener(eviction_listener)
+            .weigher(weigher)
             .build(),
         webclient: ClientBuilder::new()
-            .pool_max_idle_per_host(config.middleware_connection_threads)
+            .pool_max_idle_per_host(app_config.drone.middleware_connection_threads)
             .build()
             .unwrap(),
-        config: config.clone(),
+        config: app_config.clone(),
     });
-    println!("Drone is running on port {}.", config.port);
+    println!("Drone is running on port {}.", app_config.drone.port);
     HttpServer::new(move || {
         let cors = Cors::permissive();
         App::new()
@@ -445,7 +564,7 @@ async fn main() -> std::io::Result<()> {
             .route("/", web::post().to(api_call))
             .route("/health", web::get().to(index))
     })
-    .bind((config.hostname, config.port))?
+    .bind((app_config.drone.hostname, app_config.drone.port))?
     .run()
     .await
 }
