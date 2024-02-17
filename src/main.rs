@@ -4,7 +4,7 @@ use moka::{sync::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
-use std::sync::{Mutex};
+use std::sync::{Mutex, Arc};
 use std::time::{Duration, Instant, SystemTime};
 use std::collections::{HashMap};
 use std::sync::atomic::{self, AtomicU32};
@@ -12,6 +12,7 @@ use actix_web::rt::time::sleep;
 use futures_util::future::{FutureExt, Future,Shared};
 use std::pin::Pin;
 use std::sync::OnceLock;
+use tokio::sync::RwLock;
 use chrono::DateTime;
 
 
@@ -24,9 +25,21 @@ use method_renamer::MethodAndParams;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-// TODO: fix these, shouldn't be static globals
-static last_irreversible_block_number: AtomicU32 = AtomicU32::new(0);
-static current_head_block_number: AtomicU32 = AtomicU32::new(0);
+struct BlockchainState {
+    last_irreversible_block_number: u32,
+    head_block_number: u32,
+    head_block_time: SystemTime
+}
+
+impl BlockchainState {
+    pub fn new() -> BlockchainState {
+        BlockchainState {
+            last_irreversible_block_number: 0,
+            head_block_number: 0,
+            head_block_time: SystemTime::UNIX_EPOCH.clone()
+        }
+    }
+}
 
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -124,12 +137,13 @@ struct CacheEntry {
 
 pub struct MyExpiry;
 
-impl Expiry<String, CacheEntry> for MyExpiry {
-    /// Returns the duration of the expiration of the value that was just
-    /// created.
-    fn expire_after_create(&self, key: &String, value: &CacheEntry, _current_time: Instant) -> Option<Duration> {
+impl MyExpiry {
+    fn get_expiration(&self, key: &String, value: &CacheEntry) -> Option<Duration> {
 		match value.ttl {
-            TtlValue::NoExpire => { None }
+            TtlValue::NoExpire => { 
+                println!("MyExpiry: expire_after_create called with key {key}, returning duration None (never expire).");
+                None
+            }
 			TtlValue::DurationInSeconds(s) => { 
                 println!("MyExpiry: expire_after_create called with key {key}, returning duration {s}.");
                 Some(Duration::from_secs(s as u64))
@@ -139,6 +153,26 @@ impl Expiry<String, CacheEntry> for MyExpiry {
                 None
             }
 		}
+    }
+}
+impl Expiry<String, CacheEntry> for MyExpiry {
+    /// Returns the duration of the expiration of the value that was just
+    /// created.
+    fn expire_after_create(&self, key: &String, value: &CacheEntry, _current_time: Instant) -> Option<Duration> {
+        self.get_expiration(key, value)
+    }
+    /// We never explicitly update cache entries, we keep serving data from the cache until the
+    /// cache entry expires, then when we get a cache miss we make another call to the upstream and
+    /// insert the new value.
+    /// But it appears that there's some lazyness -- after an entry's expiration time has passed,
+    /// get() calls will return None, but the entry will still exist in the cache for a while until
+    /// the entry is actually evicted, maybe on the order of ~0.3s.  If we insert a new value
+    /// during that window, I think it considers that an "update" and not a "create", so we need to
+    /// override expire_after_update too.
+    fn expire_after_update(&self, key: &String, value: &CacheEntry, 
+                           _updated_at: Instant,
+                           _duration_until_expiry: Option<Duration>) -> Option<Duration> {
+        self.get_expiration(key, value)
     }
 }
 
@@ -169,15 +203,16 @@ fn get_block_number_from_result(result: &Value) -> Option<u32> {
 // - returning a stock error reply, without contacting the upstream, or
 // - if the block is expected to arrive in a few seconds, just wait.  once the bloc arrives, return it
 // Waiting seems better
-fn check_for_future_block_requests(mapped_method: &MethodAndParams) {
+async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: &web::Data<AppData>) {
     if mapped_method.method == "get_block" {
         if let Some(block_num) = mapped_method.params.as_ref().and_then(|v| v["block_num"].as_u64()) {
-            if block_num as u32 > current_head_block_number.load(atomic::Ordering::Acquire) {
+            let current_head_block_number = data.blockchain_state.read().await.head_block_number;
+            if block_num as u32 > current_head_block_number {
                 // we're only testing against the head block number we recorded the last
                 // time someone called get_dynamic_global_properties.
                 // we should also check that now() is < the predicted time the requested
                 // block will be produced
-                println!("future block requested: {block_num}, head is {}", current_head_block_number.load(atomic::Ordering::Acquire));
+                println!("future block requested: {block_num}, head is {current_head_block_number}");
             }
         }
     }
@@ -198,7 +233,8 @@ async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, ma
     };
 
     let upstream_request = mapped_method.format_for_upstream(&data.config);
-    println!("Making upstream request using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
+    println!("Making upstream request for {method_and_params_str}");
+    // using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
     let client = data.webclient.clone();
 
@@ -264,21 +300,26 @@ async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, ma
     println!("Mapped method is {}", mapped_method.method);
     if mapped_method.method == "get_dynamic_global_properties" {
         println!("This method was get_dynamic_global_properties");
-        if let Some(new_lib) = json_body["result"]["last_irreversible_block_num"].as_u64() {
-            if new_lib as u32 > last_irreversible_block_number.load(atomic::Ordering::Acquire) {
-                println!("new LIB is {new_lib}");
-                last_irreversible_block_number.store(new_lib as u32, atomic::Ordering::Release);
-            }
-        }
-        if let Some(new_head) = json_body["result"]["head_block_number"].as_u64() {
-            if new_head as u32 > current_head_block_number.load(atomic::Ordering::Acquire) {
-                println!("new head is {new_head}");
-                current_head_block_number.store(new_head as u32, atomic::Ordering::Release);
-                if let Some(new_time) = json_body["result"]["time"].as_str() {
-                    let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
-                    let systemtime = SystemTime::from(current_head_block_time);
-                    println!("Parsed datetime to {:?}, as systemtime: {:?}", current_head_block_time, systemtime);
+
+        let new_lib = json_body["result"]["last_irreversible_block_num"].as_u64().map(|v| v as u32);
+        let new_head = json_body["result"]["head_block_number"].as_u64().map(|v| v as u32);
+        let new_time = json_body["result"]["time"].as_str();
+        match (new_lib, new_head, new_time) {
+            (Some(new_lib), Some(new_head), Some(new_time)) => {
+                let read_lock = data.blockchain_state.read().await;
+                if new_lib > read_lock.last_irreversible_block_number || new_head > read_lock.last_irreversible_block_number {
+                    drop(read_lock);
+                    let mut write_lock = data.blockchain_state.write().await;
+                    write_lock.last_irreversible_block_number = new_lib;
+                    if new_head != write_lock.head_block_number {
+                        write_lock.head_block_number = new_head;
+                        let current_head_block_time = DateTime::parse_from_rfc3339(&format!("{new_time}Z")).unwrap();
+                        write_lock.head_block_time = SystemTime::from(current_head_block_time);
+                    }
                 }
+            }
+            _ => {
+                println!("Invalid get_dynamic_global_properties result, ignoring");
             }
         }
     }
@@ -294,13 +335,14 @@ async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, ma
     else
     {
         let mut ttl = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
-        println!("Method lookup_ttl returns {ttl:?}");
+        println!("lookup_ttl for {method_and_params_str} returns {ttl:?}");
 
         if ttl == TtlValue::ExpireIfReversible {
             // we cache forever if the block is irreversible, or 9 seconds if it's reversible
             if let Some(block_number) = get_block_number_from_result(&json_body["result"]) {
-                ttl = if block_number > last_irreversible_block_number.load(atomic::Ordering::Acquire) { TtlValue::DurationInSeconds(9) } else { TtlValue::NoExpire };
-                println!("block number from result is {block_number}, lib is {}, setting ttl to {:?}", last_irreversible_block_number.load(atomic::Ordering::Acquire), ttl);
+                let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
+                ttl = if block_number > last_irreversible_block_number { TtlValue::DurationInSeconds(9) } else { TtlValue::NoExpire };
+                println!("block number from result is {block_number}, lib is {last_irreversible_block_number}, setting ttl to {:?}", ttl);
             }
         }
         match ttl {
@@ -310,6 +352,7 @@ async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, ma
                     size: body.len() as u32,
                     ttl
                 };
+                println!("Storing result in cache for {method_and_params_str} with ttl {ttl:?}, cache size before store is {}", data.cache.weighted_size());
                 data.cache.insert(method_and_params_str, entry);
             }
             _ => {}
@@ -342,7 +385,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
         }
     };
 
-    check_for_future_block_requests(&mapped_method);
+    check_for_future_block_requests(&mapped_method, &data).await;
 
     // Get humantime for logging.
     let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
@@ -361,10 +404,9 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
 
     // Check if the call is in the cache. If it is, return it
     let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
-    let method_and_params_str = format!("{}({params_str})", mapped_method.method);
-    println!("Using cache key {method_and_params_str}");
+    let method_and_params_str = format!("{}({params_str})", mapped_method.get_dotted_method_name());
     if let Some(cached_call) = data.cache.get(&method_and_params_str) {
-        println!("Cache hit");
+        println!("Cache hit for {method_and_params_str}");
         return Ok(APICallResponse {
             jsonrpc: request.jsonrpc.clone(),
             result: cached_call.result.clone(),
@@ -375,7 +417,7 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
             upstream_method: None
         });
     }
-    println!("Cache miss");
+    println!("Cache miss for {method_and_params_str}");
 
     // Check and see if another thread is currently handling this call.  If it is, join them
     let in_progress_call: InProgressCall;
@@ -401,12 +443,19 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
         println!("Multiple calls in progress: {method_and_params_str}: {}", in_progress_call.call_count);
     }
 
-    let upstream_response = in_progress_call.future.await;
+    let mut upstream_response = in_progress_call.future.await;
 
     // one caller needs to remove the entry from the registry when the upstream call has completed.
     // It doesn't matter who does it, so we arbitrarily decide to make it the first caller.
 	if first_caller	{
         in_progress_call_registry().lock().unwrap().remove(&method_and_params_str);
+    } else {
+        // the shared future will return a response that says it isn't cached.  That's technically
+        // true because it didn't come from the cache, but what we really want to know is: did we
+        // have to make an upstream request, so we set all but the first_caller to cached
+        if let Ok(result) = upstream_response.as_mut() {
+            result.cached = true;
+        }
     }
 
     upstream_response
@@ -511,6 +560,7 @@ struct AppData {
     cache: Cache<String, CacheEntry>,
     webclient: Client,
     config: AppConfig,
+    blockchain_state: Arc<RwLock<BlockchainState>>
 }
 
 /// Singleton registry that holds futures for all currently-in-progress calls to the upstream servers,
@@ -547,6 +597,7 @@ async fn main() -> std::io::Result<()> {
             .build()
             .unwrap(),
         config: app_config.clone(),
+        blockchain_state: Arc::new(RwLock::new(BlockchainState::new()))
     });
     println!("Drone is running on port {}.", app_config.drone.port);
     HttpServer::new(move || {

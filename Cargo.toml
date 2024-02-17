@@ -22,3 +22,4 @@ moka = { version = "0.12.5", features = ["sync"] }
 sequence_trie = "0.3.6"
 futures-util = "0.3.30"
 chrono = "0.4.34"
+tokio = { version = "1.36.0", features = ["sync"] }
