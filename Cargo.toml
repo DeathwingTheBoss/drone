@@ -18,7 +18,7 @@ humantime = "2.1.0"
 config = "0.13.3"
 actix-cors = "0.6.4"
 async-recursion = "1.0.5"
-moka = { version = "0.12.5", features = ["sync"] }
+moka = { version = "0.12.5", features = ["future"] }
 sequence_trie = "0.3.6"
 futures-util = "0.3.30"
 chrono = "0.4.34"

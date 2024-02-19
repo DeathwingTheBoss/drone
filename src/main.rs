@@ -1,17 +1,12 @@
 use actix_cors::Cors;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
-use moka::{sync::Cache, Expiry};
+use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
-use std::sync::{Mutex, Arc};
+use std::sync::{Arc};
 use std::time::{Duration, Instant, SystemTime};
-use std::collections::{HashMap};
-use std::sync::atomic::{self, AtomicU32};
 use actix_web::rt::time::sleep;
-use futures_util::future::{FutureExt, Future,Shared};
-use std::pin::Pin;
-use std::sync::OnceLock;
 use tokio::sync::RwLock;
 use chrono::DateTime;
 
@@ -36,7 +31,7 @@ impl BlockchainState {
         BlockchainState {
             last_irreversible_block_number: 0,
             head_block_number: 0,
-            head_block_time: SystemTime::UNIX_EPOCH.clone()
+            head_block_time: SystemTime::UNIX_EPOCH
         }
     }
 }
@@ -104,6 +99,13 @@ impl Serialize for ErrorField {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ErrorData {
+    code: i32,
+    message: String,
+    error: ErrorField,
+}
+
 // Structure for the error response.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ErrorStructure {
@@ -112,6 +114,14 @@ struct ErrorStructure {
     code: i32,
     message: String,
     error: ErrorField,
+}
+
+#[derive(Clone, Debug)]
+struct ApiCallResponseData {
+    result: Value,
+    // the following fields are for emitting debugging headers, not strictly necessary:
+    backend_url: String,
+    upstream_method: String
 }
 
 #[derive(Clone)]
@@ -124,15 +134,22 @@ struct APICallResponse {
     // data returned just for logging/debugging
     cached: bool,
     mapped_method: MethodAndParams, // the method, parsed and transformed
-    backend_url: Option<String>,
-    upstream_method: Option<String>
+    backend_url: String,
+    upstream_method: String
+}
+
+#[derive(Debug, Copy, Clone)]
+enum CacheTtl {
+    NoCache,
+    NoExpire,
+    CacheForDuration(Duration)
 }
 
 #[derive(Clone, Debug)]
 struct CacheEntry {
-    result: Value,
+    result: Result<ApiCallResponseData, ErrorData>,
     size: u32,
-	ttl: TtlValue
+	ttl: CacheTtl,
 }
 
 pub struct MyExpiry;
@@ -140,21 +157,22 @@ pub struct MyExpiry;
 impl MyExpiry {
     fn get_expiration(&self, key: &String, value: &CacheEntry) -> Option<Duration> {
 		match value.ttl {
-            TtlValue::NoExpire => { 
-                println!("MyExpiry: expire_after_create called with key {key}, returning duration None (never expire).");
+            CacheTtl::NoExpire => { 
+                println!("MyExpiry: get_expiration called with key {key}, returning duration None (never expire).");
                 None
             }
-			TtlValue::DurationInSeconds(s) => { 
-                println!("MyExpiry: expire_after_create called with key {key}, returning duration {s}.");
-                Some(Duration::from_secs(s as u64))
+            CacheTtl::NoCache => {
+                println!("MyExpiry: get_expiration called with key {key}, returning duration 0 (don't cache).");
+                Some(Duration::ZERO)
             }
-			_ => { 
-                println!("MyExpiry: expire_after_create called with key {key} that doesn't have a duration in seconds, this is unexpected.");
-                None
+            CacheTtl::CacheForDuration(duration) => {
+                println!("MyExpiry: get_expiration called with key {key}, returning duration {:?}", duration);
+                Some(duration)
             }
-		}
+        }
     }
 }
+
 impl Expiry<String, CacheEntry> for MyExpiry {
     /// Returns the duration of the expiration of the value that was just
     /// created.
@@ -200,9 +218,11 @@ fn get_block_number_from_result(result: &Value) -> Option<u32> {
 // check a request to see if it's asking for a block that doesn't exist yet.  We get a lot of API
 // calls that do this, presumably clients that are just polling for the next block.
 // This is a case we can optimize.  Either by:
-// - returning a stock error reply, without contacting the upstream, or
-// - if the block is expected to arrive in a few seconds, just wait.  once the bloc arrives, return it
-// Waiting seems better
+// - returning a stock error reply without contacting the upstream, or
+// - if the block is expected to arrive in a few seconds, just wait.  once the block arrives, return it
+// Waiting seems better, because if we don't, the client will probably just make the same request
+// again (maybe after a short sleep).  And if we do it right, it may give them the block sooner
+// than their polling loop would have.
 async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: &web::Data<AppData>) {
     if mapped_method.method == "get_block" {
         if let Some(block_num) = mapped_method.params.as_ref().and_then(|v| v["block_num"].as_u64()) {
@@ -218,17 +238,19 @@ async fn check_for_future_block_requests(mapped_method: &MethodAndParams, data: 
     }
 }
 
-async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String) -> Result<APICallResponse, ErrorStructure> {
+async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAndParams, method_and_params_str: String) -> CacheEntry {
     let endpoint = match data.config.lookup_url(mapped_method.get_method_name_parts()) {
         Some(endpoint) => { endpoint }
         None => {
-            return Err(ErrorStructure {
-                jsonrpc: request.jsonrpc.clone(),
-                id : request.id.clone(),
-                code: -32700,
-                message: format!("Unable to map request to endpoint."),
-                error: ErrorField::Message("Unable to map request to endpoint.".to_string()),
-            });
+            return CacheEntry {
+                result: Err(ErrorData {
+                    code: -32603, // or 32601?
+                    message: "Unable to map request to endpoint.".to_string(),
+                    error: ErrorField::Message("Unable to map request to endpoint.".to_string()),
+                }),
+                size: 0,
+                ttl: CacheTtl::NoCache
+            };
         }
     };
 
@@ -249,51 +271,59 @@ async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, ma
         Err(err) => {
             let mut error_message = err.without_url().to_string();
             error_message.push_str(&endpoint.to_string());
-            return Err(ErrorStructure {
-                jsonrpc: request.jsonrpc.clone(),
-                id : request.id.clone(),
-                code: -32700,
-                message: format!("Unable to send request to endpoint."),
-                error: ErrorField::Message(error_message),
-            })
+            return CacheEntry {
+                result: Err(ErrorData {
+                    code: -32700,
+                    message: "Unable to send request to endpoint.".to_string(),
+                    error: ErrorField::Message(error_message),
+                }),
+                size: 0,
+                ttl: CacheTtl::NoCache
+            };
         }
     };
 
     // to simulate slow calls, put a sleep here
-    // sleep(Duration::from_secs(10)).await;
+    sleep(Duration::from_secs(10)).await;
 
     let body = match res.text().await {
         Ok(text) => text,
         Err(err) => {
-            return Err(ErrorStructure {
-                jsonrpc: request.jsonrpc.clone(),
-                id : request.id.clone(),
-                code: -32600,
-                message: format!("Received an invalid response from the endpoint."),
-                error: ErrorField::Message(err.to_string()),
-            })
+            return CacheEntry {
+                result: Err(ErrorData {
+                    code: -32600,
+                    message: "Received an invalid response from the endpoint.".to_string(),
+                    error: ErrorField::Message(err.to_string()),
+                }),
+                size: 0,
+                ttl: CacheTtl::NoCache
+            };
         }
     };
-    let json_body: serde_json::Value = match serde_json::from_str(&body) {
+    let mut json_body: serde_json::Value = match serde_json::from_str(&body) {
         Ok(parsed) => parsed,
         Err(err) => {
-            return Err(ErrorStructure {
-                jsonrpc: request.jsonrpc.clone(),
-                id : request.id.clone(),
-                code: -32602,
-                message: format!("Unable to parse endpoint data."),
-                error: ErrorField::Message(err.to_string()),
-            })
+            return CacheEntry {
+                result: Err(ErrorData {
+                    code: -32602,
+                    message: "Unable to parse endpoint data.".to_string(),
+                    error: ErrorField::Message(err.to_string()),
+                }),
+                size: 0,
+                ttl: CacheTtl::NoCache
+            };
         }
     };
     if json_body["error"].is_object() {
-        return Err(ErrorStructure {
-            jsonrpc: request.jsonrpc.clone(),
-            id : request.id.clone(),
-            code: -32700,
-            message: format!("Endpoint returned an error."),
-            error: ErrorField::Object(json_body["error"].clone()),
-        });
+        return CacheEntry {
+            result: Err(ErrorData {
+                code: -32700,
+                message: "Endpoint returned an error.".to_string(),
+                error: ErrorField::Object(json_body["error"].clone()),
+            }),
+            size: 0,
+            ttl: CacheTtl::NoCache
+        };
     }
 
     // if the call was to get_dynamic_global_properties, save off the last irreversible block
@@ -324,68 +354,63 @@ async fn request_from_upstream(request: APIRequest, data: web::Data<AppData>, ma
         }
     }
 
-
-    if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
-        || json_body["result"].is_null()
-        || json_body["result"]["blocks"].is_array() && json_body["result"]["blocks"].as_array().unwrap().is_empty()
+    let ttl = if json_body["result"].is_array() && json_body["result"].as_array().unwrap().is_empty()
+                 || json_body["result"].is_null()
+                 || json_body["result"]["blocks"].is_array() && json_body["result"]["blocks"].as_array().unwrap().is_empty()
     {
         // then this result shouldn't be cached
         // TODO: why?
+        CacheTtl::NoCache
     }
     else
     {
-        let mut ttl = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
-        println!("lookup_ttl for {method_and_params_str} returns {ttl:?}");
+        let ttl_from_config = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
+        println!("lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
 
-        if ttl == TtlValue::ExpireIfReversible {
-            // we cache forever if the block is irreversible, or 9 seconds if it's reversible
-            if let Some(block_number) = get_block_number_from_result(&json_body["result"]) {
-                let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
-                ttl = if block_number > last_irreversible_block_number { TtlValue::DurationInSeconds(9) } else { TtlValue::NoExpire };
-                println!("block number from result is {block_number}, lib is {last_irreversible_block_number}, setting ttl to {:?}", ttl);
+        match ttl_from_config {
+            TtlValue::NoCache => { CacheTtl::NoCache }
+            TtlValue::NoExpire => { CacheTtl::NoExpire }
+            TtlValue::ExpireIfReversible => {
+                // we cache forever if the block is irreversible, or 9 seconds if it's reversible
+                if let Some(block_number) = get_block_number_from_result(&json_body["result"]) {
+                    let last_irreversible_block_number = data.blockchain_state.read().await.last_irreversible_block_number;
+                    if block_number > last_irreversible_block_number { CacheTtl::CacheForDuration(Duration::from_secs(9)) } else { CacheTtl::NoExpire }
+                } else {
+                    // we couldn't extract a block number from the result.  probably an error
+                    // result, or the config has specified ExpireIfReversible for a call that isn't
+                    // supported by get_block_number_from_result
+                    CacheTtl::NoCache
+                }
             }
+            TtlValue::HonorUpstreamCacheControl => { CacheTtl::NoCache /* TODO: implement this */ }
+            TtlValue::DurationInSeconds(seconds) => { CacheTtl::CacheForDuration(Duration::from_secs(seconds as u64)) }
         }
-        match ttl {
-            TtlValue::NoExpire | TtlValue::DurationInSeconds(_) => {
-                let entry = CacheEntry {
-                    result: json_body["result"].clone(),
-                    size: body.len() as u32,
-                    ttl
-                };
-                println!("Storing result in cache for {method_and_params_str} with ttl {ttl:?}, cache size before store is {}", data.cache.weighted_size());
-                data.cache.insert(method_and_params_str, entry);
-            }
-            _ => {}
-        }
+    };
+
+    CacheEntry {
+        result: Ok(ApiCallResponseData {
+            result: json_body["result"].take(),
+            backend_url: endpoint.to_string(),
+            upstream_method: upstream_request.method.to_string()
+        }),
+        size: body.len() as u32,
+        ttl
     }
-
-    Ok(APICallResponse {
-        jsonrpc: request.jsonrpc.clone(),
-        result: json_body["result"].clone(),
-        id: request.id.clone(),
-        cached: false,
-        mapped_method,
-        backend_url: Some(endpoint.clone()),
-        upstream_method: Some(upstream_request.method.clone())
-    })
 }
 
 async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String) -> Result<APICallResponse, ErrorStructure> {
     // perform any requested mappings, this may give us different method names & and params
-    let mapped_method = match method_renamer::map_method_name(&data.config, &request.method, &request.params) {
-        Ok(mapped_method) => { mapped_method }
-        Err(_) => {
-            return Err(ErrorStructure {
-                jsonrpc: request.jsonrpc.clone(),
-                id : request.id.clone(),
-                code: -32700,
-                message: format!("Unable to parse request method."),
-                error: ErrorField::Message("Unable to parse request method.".to_string()),
-            });
-        }
-    };
+    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).or_else(|_| 
+        Err(ErrorStructure {
+            jsonrpc: request.jsonrpc.clone(),
+            id : request.id.clone(),
+            code: -32700,
+            message: "Unable to parse request method.".to_string(),
+            error: ErrorField::Message("Unable to parse request method.".to_string()),
+        })
+    )?;
 
-    check_for_future_block_requests(&mapped_method, &data).await;
+    check_for_future_block_requests(&mapped_method, data).await;
 
     // Get humantime for logging.
     let human_timestamp = humantime::format_rfc3339_seconds(std::time::SystemTime::now());
@@ -402,63 +427,55 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
     };
     println!("{}", formatted_log);
 
-    // Check if the call is in the cache. If it is, return it
+    // Get the result of the call.  The get_with() call below will:
+    // - see if the result of the call is cached.  If so, return the result immediately
+    // - if not, it checks whether some other task is currently calling the upstream to
+    //   get the result of this same call.  If so, it will just share their result instead
+    //   of initiating a second call
+    // - otherwise, it will call the closure (request_from_upstream()) to get the result,
+    //   then insert it into the cache
+    //
+    // notes: 
+    // - moka is in charge of this behavior, and it behaves the way we want, but that means
+    //   we have less information about exactly what happened when we call get_with().  
+    //   We say that the result is "cached" if the closure didn't get executed; that could
+    //   mean that the result was already in the cache, or it could mean that another task/thread
+    //   was already in the process of requesting it.  That means times for some "cached" calls
+    //   could be as long as non-cached calls.  Just something to be aware of.
+    // - to get this "combining multiple simultaneous calls" behavior, we're inserting every
+    //   result into the cache, even if it's marked as something we don't want to cache in the
+    //   config (we just insert them with a TTL of zero).  That may cause some 
+    //   unnecessary/unwanted effects, but so far performance seems to be the same compared to
+    //   an alternate implementation where the caching and combining were handled separately.
     let params_str = request.params.as_ref().map_or("[]".to_string(), |v: &Value| v.to_string());
-    let method_and_params_str = format!("{}({params_str})", mapped_method.get_dotted_method_name());
-    if let Some(cached_call) = data.cache.get(&method_and_params_str) {
-        println!("Cache hit for {method_and_params_str}");
-        return Ok(APICallResponse {
-            jsonrpc: request.jsonrpc.clone(),
-            result: cached_call.result.clone(),
-            id: request.id,
-            cached: true,
-            mapped_method,
-            backend_url: None,
-            upstream_method: None
-        });
-    }
-    println!("Cache miss for {method_and_params_str}");
+    let method_and_params_str = mapped_method.get_dotted_method_name() + "(" + &params_str + ")";
 
-    // Check and see if another thread is currently handling this call.  If it is, join them
-    let in_progress_call: InProgressCall;
-	let first_caller: bool;
-    {
-        let mut in_progress = in_progress_call_registry().lock().unwrap();
-        in_progress_call = if let Some(value) = in_progress.get_mut(&method_and_params_str) {
-			first_caller = false;
-            value.call_count += 1;
-            value.clone()
-        } else {
-			first_caller = true;
-            let upstream_request_record = InProgressCall {
-                future: request_from_upstream(request, data.clone(), mapped_method, method_and_params_str.clone()).boxed().shared(),
-                call_count: 1,
-                first_call_start_time: Instant::now()
-            };
-            in_progress.insert(method_and_params_str.clone(), upstream_request_record.clone());
-            upstream_request_record
+    let mut upstream_was_called = false;
+    let cache_entry = data.cache.get_with_by_ref(&method_and_params_str,
+                                                 async { upstream_was_called = true; request_from_upstream(data.clone(), mapped_method.clone(), method_and_params_str.clone()).await }).await;
+
+    match cache_entry.result {
+        Ok(api_call_response) => {
+            Ok(APICallResponse {
+                jsonrpc: request.jsonrpc.clone(),
+                result: api_call_response.result.clone(),
+                id: request.id,
+                cached: !upstream_was_called,
+                mapped_method,
+                backend_url: api_call_response.backend_url.to_string(),
+                upstream_method: api_call_response.upstream_method.to_string()
+            })
+        }
+        Err(error_data) => {
+            Err(ErrorStructure {
+                jsonrpc: request.jsonrpc.clone(),
+                id : request.id,
+                code: error_data.code,
+                message: error_data.message.to_string(),
+                error: error_data.error.clone()
+            })
         }
     }
-    if !first_caller {
-        println!("Multiple calls in progress: {method_and_params_str}: {}", in_progress_call.call_count);
-    }
-
-    let mut upstream_response = in_progress_call.future.await;
-
-    // one caller needs to remove the entry from the registry when the upstream call has completed.
-    // It doesn't matter who does it, so we arbitrarily decide to make it the first caller.
-	if first_caller	{
-        in_progress_call_registry().lock().unwrap().remove(&method_and_params_str);
-    } else {
-        // the shared future will return a response that says it isn't cached.  That's technically
-        // true because it didn't come from the cache, but what we really want to know is: did we
-        // have to make an upstream request, so we set all but the first_caller to cached
-        if let Ok(result) = upstream_response.as_mut() {
-            result.cached = true;
-        }
-    }
-
-    upstream_response
 }
 
 async fn api_call(
@@ -496,8 +513,8 @@ async fn api_call(
                     .insert_header(("X-Jussi-Api", response.mapped_method.api.unwrap_or("<Empty>".to_string())))
                     .insert_header(("X-Jussi-Method", response.mapped_method.method))
                     .insert_header(("X-Jussi-Params", response.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())))
-                    .insert_header(("X-Jussi-Backend-Url", response.backend_url.unwrap_or("".to_string())))
-                    .insert_header(("X-Jussi-Upstream-Method", response.upstream_method.unwrap_or("".to_string())))
+                    .insert_header(("X-Jussi-Backend-Url", response.backend_url))
+                    .insert_header(("X-Jussi-Upstream-Method", response.upstream_method))
                     .json(serde_json::json!({
                         "jsonrpc": response.jsonrpc,
                         "result": response.result,
@@ -547,27 +564,11 @@ async fn api_call(
     }
 }
 
-#[derive(Clone)]
-struct InProgressCall {
-    future: Shared<Pin<Box<dyn Future<Output = Result<APICallResponse, ErrorStructure>> + Send>>>,
-    /// the rest of this data structure is just info we track for debugging/logging,
-    /// we could omit them and Drone would work the same
-    call_count: u32,
-    first_call_start_time: Instant,
-}
-
 struct AppData {
     cache: Cache<String, CacheEntry>,
     webclient: Client,
     config: AppConfig,
     blockchain_state: Arc<RwLock<BlockchainState>>
-}
-
-/// Singleton registry that holds futures for all currently-in-progress calls to the upstream servers,
-/// indexed by method name and parameters
-fn in_progress_call_registry() -> &'static Mutex<HashMap<String, InProgressCall>> {
-    static INSTANCE: OnceLock<Mutex<HashMap<String, InProgressCall>>> = OnceLock::new();
-    INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[actix_web::main]
