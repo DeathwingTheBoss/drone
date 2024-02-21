@@ -10,7 +10,8 @@ pub struct MethodAndParams {
     pub namespace: String,
     pub api: Option<String>,
     pub method: String,
-    pub params: Option<Value>
+    pub params: Option<Value>,
+    pub full_method: String // the method as called (usually api.method)
 }
 
 impl MethodAndParams {
@@ -39,7 +40,7 @@ impl MethodAndParams {
         APIRequest {
             id: 1,
             jsonrpc: "2.0".to_string(),
-            method: self.api.as_ref().map_or("".to_string(), |api| api.clone() + ".") + &self.method,
+            method: self.full_method.to_string(),
             params: self.params.clone()
         }
     }
@@ -63,19 +64,29 @@ fn decode_api_if_numeric(api: &Value) -> Result<String, String> {
 fn parse_call(params: &Option<Value>) -> Result<MethodAndParams, String> {
     match params.as_ref().and_then(Value::as_array).map(Vec::as_slice) {
         Some([api, method]) => {
+            let api_part = decode_api_if_numeric(api)?;
+            let method_part = method.as_str().ok_or_else(|| "Invalid method name".to_string())?;
+            let full_method = api_part.to_string() + "." + method_part;
+
             Ok(MethodAndParams {
                 namespace: "appbase".to_string(),
-                api: Some(decode_api_if_numeric(api)?),
-                method: method.as_str().ok_or("Invalid method name".to_string())?.to_string(),
-                params: None
+                api: Some(api_part),
+                method: method_part.to_string(),
+                params: None,
+                full_method
             })
         }
         Some([api, method, actual_params]) => {
+            let api_part = decode_api_if_numeric(api)?;
+            let method_part = method.as_str().ok_or_else(|| "Invalid method name".to_string())?;
+            let full_method = api_part.to_string() + "." + method_part;
+
             Ok(MethodAndParams {
                 namespace: if api == "condenser_api" || api == "jsonrpc" || actual_params.is_object() { "appbase".to_string() } else { "hived".to_string() },
-                api: Some(decode_api_if_numeric(api)?),
-                method: method.as_str().ok_or("Invalid method name".to_string())?.to_string(),
-                params: Some(actual_params.clone())
+                api: Some(api_part),
+                method: method_part.to_string(),
+                params: Some(actual_params.clone()),
+                full_method
             })
         }
         _ => { 
@@ -84,8 +95,8 @@ fn parse_call(params: &Option<Value>) -> Result<MethodAndParams, String> {
     }
 }
 
-fn convert_method_name(method: &str, params: &Option<Value>) -> Result<MethodAndParams, String> {
-    let parts: Vec<&str> = method.split('.').collect();
+fn convert_method_name(full_method: &str, params: &Option<Value>) -> Result<MethodAndParams, String> {
+    let parts: Vec<&str> = full_method.split('.').collect();
     match &parts[..] {
         ["call"] => {
             parse_call(params)
@@ -95,7 +106,8 @@ fn convert_method_name(method: &str, params: &Option<Value>) -> Result<MethodAnd
                 namespace: "hived".to_string(),
                 api: Some("database_api".to_string()), 
                 method: bare_method.to_string(),
-                params: params.clone()
+                params: params.clone(),
+                full_method: full_method.to_string()
             })
         }
         [appbase_api, method] if appbase_api.ends_with("_api") => {
@@ -104,7 +116,8 @@ fn convert_method_name(method: &str, params: &Option<Value>) -> Result<MethodAnd
                 namespace: "appbase".to_string(),
                 api: Some(appbase_api.to_string()),
                 method: method.to_string(),
-                params: params.clone()
+                params: params.clone(),
+                full_method: full_method.to_string()
             })
         }
         ["jsonrpc", method] => {
@@ -112,7 +125,8 @@ fn convert_method_name(method: &str, params: &Option<Value>) -> Result<MethodAnd
                 namespace: "appbase".to_string(),
                 api: Some("jsonrpc".to_string()),
                 method: method.to_string(),
-                params: params.clone()
+                params: params.clone(),
+                full_method: full_method.to_string()
             })
         }
         [namespace, method] => {
@@ -122,7 +136,8 @@ fn convert_method_name(method: &str, params: &Option<Value>) -> Result<MethodAnd
                 namespace: namespace.to_string(),
                 api: None,
                 method: method.to_string(),
-                params: params.clone()
+                params: params.clone(),
+                full_method: full_method.to_string()
             })
         }
         [namespace, api, method] => {
@@ -130,7 +145,8 @@ fn convert_method_name(method: &str, params: &Option<Value>) -> Result<MethodAnd
                 namespace: namespace.to_string(),
                 api: Some(api.to_string()),
                 method: method.to_string(),
-                params: params.clone()
+                params: params.clone(),
+                full_method: full_method.to_string()
             })
         }
         _ => {

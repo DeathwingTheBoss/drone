@@ -1,12 +1,12 @@
 use actix_cors::Cors;
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpResponseBuilder, HttpServer, Responder, http::StatusCode};
 use moka::{future::Cache, Expiry};
 use reqwest::{Client, ClientBuilder};
 use serde::{Deserialize, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::{Arc};
 use std::time::{Duration, Instant, SystemTime};
-use actix_web::rt::time::sleep;
+//use actix_web::rt::time::sleep;
 use tokio::sync::RwLock;
 use chrono::DateTime;
 
@@ -19,6 +19,7 @@ pub mod method_renamer;
 use method_renamer::MethodAndParams;
 
 const DRONE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 
 struct BlockchainState {
     last_irreversible_block_number: u32,
@@ -35,7 +36,6 @@ impl BlockchainState {
         }
     }
 }
-
 
 #[derive(Serialize, Deserialize, Debug)]
 struct HealthCheck {
@@ -99,43 +99,67 @@ impl Serialize for ErrorField {
     }
 }
 
-#[derive(Clone, Debug)]
-struct ErrorData {
-    code: i32,
-    message: String,
-    error: ErrorField,
+// data returned just for logging/debugging
+#[derive(Clone,Debug)]
+struct ResponseTrackingInfo {
+    cached: bool,
+    mapped_method: MethodAndParams, // the method, parsed and transformed
+    backend_url: Option<String>,
+    upstream_method: Option<String>
 }
 
-// Structure for the error response.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-struct ErrorStructure {
-    jsonrpc: String,
-    id: ID,
-    code: i32,
-    message: String,
-    error: ErrorField,
+impl ResponseTrackingInfo {
+    fn to_headers(self, reply_builder: &mut HttpResponseBuilder) {
+        reply_builder.insert_header(("X-Jussi-Cache-Hit", self.cached.to_string()));
+        reply_builder.insert_header(("X-Jussi-Namespace", self.mapped_method.namespace));
+        reply_builder.insert_header(("X-Jussi-Api", self.mapped_method.api.unwrap_or("<Empty>".to_string())));
+        reply_builder.insert_header(("X-Jussi-Method", self.mapped_method.method));
+        reply_builder.insert_header(("X-Jussi-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
+        if self.backend_url.is_some() {
+            reply_builder.insert_header(("X-Jussi-Backend-Url", self.backend_url.unwrap()));
+        }
+        if self.upstream_method.is_some() {
+            reply_builder.insert_header(("X-Jussi-Upstream-Method", self.upstream_method.unwrap()));
+        }
+    }
+}
+
+// ErrorData and ApiCallResponseData are the values stored in the cache.  It's
+// everything about a reply that isn't specific to the caller (i.e., not the 
+// `jsonrpc` and `id` fields)
+#[derive(Clone, Debug)]
+struct ErrorData {
+    error: Value,
+    http_status: StatusCode,
+    tracking_info: Option<ResponseTrackingInfo>
 }
 
 #[derive(Clone, Debug)]
 struct ApiCallResponseData {
     result: Value,
-    // the following fields are for emitting debugging headers, not strictly necessary:
-    backend_url: String,
-    upstream_method: String
+    tracking_info: Option<ResponseTrackingInfo>
+}
+
+// The full error and response structures, including caller-specific data
+#[derive(Debug, Clone)]
+struct ErrorStructure {
+    jsonrpc: String,
+    id: u32,
+    error: Value,
+    http_status: StatusCode,
+    tracking_info: Option<ResponseTrackingInfo>
 }
 
 #[derive(Clone)]
 struct APICallResponse {
     /// the original value of jsonrpc request made by the caller (usually "2.0")
     jsonrpc: String,
-    result: Value,
     /// the id the caller used in their request
     id: ID,
-    // data returned just for logging/debugging
-    cached: bool,
-    mapped_method: MethodAndParams, // the method, parsed and transformed
-    backend_url: String,
-    upstream_method: String
+
+    result: Value,
+
+    tracking_info: Option<ResponseTrackingInfo>
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -244,9 +268,18 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         None => {
             return CacheEntry {
                 result: Err(ErrorData {
-                    code: -32603, // or 32601?
-                    message: "Unable to map request to endpoint.".to_string(),
-                    error: ErrorField::Message("Unable to map request to endpoint.".to_string()),
+                    error: json!({
+                        "code": -32603, // or 32601?
+                        "message": "Unable to map request to endpoint.",
+                        "error": "Unable to map request to endpoint."
+                    }),
+                    http_status: StatusCode::NOT_FOUND,
+                    tracking_info: Some(ResponseTrackingInfo {
+                        cached: false,
+                        mapped_method,
+                        backend_url: None,
+                        upstream_method: None
+                    })
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -259,6 +292,13 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     // using method {:?} and params {:?}", upstream_request.method, upstream_request.params);
 
     let client = data.webclient.clone();
+
+    let tracking_info = Some(ResponseTrackingInfo {
+        cached: false,
+        mapped_method,
+        backend_url: Some(endpoint.to_string()),
+        upstream_method: Some(upstream_request.method.clone())
+    });
 
     // Send the request to the endpoints.
     let res = match client
@@ -273,9 +313,13 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
             error_message.push_str(&endpoint.to_string());
             return CacheEntry {
                 result: Err(ErrorData {
-                    code: -32700,
-                    message: "Unable to send request to endpoint.".to_string(),
-                    error: ErrorField::Message(error_message),
+                    error: json!({
+                        "code": -32700,
+                        "message": "Unable to send request to endpoint.",
+                        "error": error_message
+                    }),
+                    http_status: StatusCode::SERVICE_UNAVAILABLE,
+                    tracking_info
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -284,16 +328,20 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     };
 
     // to simulate slow calls, put a sleep here
-    sleep(Duration::from_secs(10)).await;
+    // sleep(Duration::from_secs(10)).await;
 
     let body = match res.text().await {
         Ok(text) => text,
         Err(err) => {
             return CacheEntry {
                 result: Err(ErrorData {
-                    code: -32600,
-                    message: "Received an invalid response from the endpoint.".to_string(),
-                    error: ErrorField::Message(err.to_string()),
+                    error: json!({
+                        "code": -32600,
+                        "message": "Received an invalid response from the endpoint.",
+                        "error": err.to_string(),
+                    }),
+                    http_status: StatusCode::INTERNAL_SERVER_ERROR,
+                    tracking_info
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -305,9 +353,13 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
         Err(err) => {
             return CacheEntry {
                 result: Err(ErrorData {
-                    code: -32602,
-                    message: "Unable to parse endpoint data.".to_string(),
-                    error: ErrorField::Message(err.to_string()),
+                    error: json!({
+                        "code": -32602,
+                        "message": "Unable to parse endpoint data.",
+                        "error": err.to_string(),
+                    }),
+                    http_status: StatusCode::INTERNAL_SERVER_ERROR,
+                    tracking_info
                 }),
                 size: 0,
                 ttl: CacheTtl::NoCache
@@ -317,9 +369,9 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     if json_body["error"].is_object() {
         return CacheEntry {
             result: Err(ErrorData {
-                code: -32700,
-                message: "Endpoint returned an error.".to_string(),
-                error: ErrorField::Object(json_body["error"].clone()),
+                error: json_body["error"].take(),
+                http_status: StatusCode::OK,
+                tracking_info
             }),
             size: 0,
             ttl: CacheTtl::NoCache
@@ -327,8 +379,10 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     }
 
     // if the call was to get_dynamic_global_properties, save off the last irreversible block
-    println!("Mapped method is {}", mapped_method.method);
-    if mapped_method.method == "get_dynamic_global_properties" {
+    let mapped_method_ref = &tracking_info.as_ref().unwrap().mapped_method;
+    let method_name_only = &mapped_method_ref.method;
+    println!("Mapped method is {}", method_name_only);
+    if method_name_only == "get_dynamic_global_properties" {
         println!("This method was get_dynamic_global_properties");
 
         let new_lib = json_body["result"]["last_irreversible_block_num"].as_u64().map(|v| v as u32);
@@ -364,7 +418,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     }
     else
     {
-        let ttl_from_config = *data.config.lookup_ttl(mapped_method.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
+        let ttl_from_config = *data.config.lookup_ttl(mapped_method_ref.get_method_name_parts()).unwrap_or(&TtlValue::NoCache);
         println!("lookup_ttl for {method_and_params_str} returns {ttl_from_config:?}");
 
         match ttl_from_config {
@@ -390,8 +444,7 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
     CacheEntry {
         result: Ok(ApiCallResponseData {
             result: json_body["result"].take(),
-            backend_url: endpoint.to_string(),
-            upstream_method: upstream_request.method.to_string()
+            tracking_info
         }),
         size: body.len() as u32,
         ttl
@@ -400,14 +453,18 @@ async fn request_from_upstream(data: web::Data<AppData>, mapped_method: MethodAn
 
 async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_ip: &String) -> Result<APICallResponse, ErrorStructure> {
     // perform any requested mappings, this may give us different method names & and params
-    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).or_else(|_| 
-        Err(ErrorStructure {
+    let mapped_method = method_renamer::map_method_name(&data.config, &request.method, &request.params).map_err(|_| 
+        ErrorStructure {
             jsonrpc: request.jsonrpc.clone(),
             id : request.id.clone(),
-            code: -32700,
-            message: "Unable to parse request method.".to_string(),
-            error: ErrorField::Message("Unable to parse request method.".to_string()),
-        })
+            error: json!({
+                "code": -32700,
+                "message": "Unable to parse request method.",
+                "error": "Unable to parse request method."
+            }),
+            http_status: StatusCode::NOT_FOUND,
+            tracking_info: None
+        }
     )?;
 
     check_for_future_block_requests(&mapped_method, data).await;
@@ -456,24 +513,29 @@ async fn handle_request(request: APIRequest, data: &web::Data<AppData>, client_i
 
     match cache_entry.result {
         Ok(api_call_response) => {
-            Ok(APICallResponse {
-                jsonrpc: request.jsonrpc.clone(),
-                result: api_call_response.result.clone(),
+            let mut response = APICallResponse {
+                jsonrpc: request.jsonrpc,
                 id: request.id,
-                cached: !upstream_was_called,
-                mapped_method,
-                backend_url: api_call_response.backend_url.to_string(),
-                upstream_method: api_call_response.upstream_method.to_string()
-            })
+                result: api_call_response.result,
+                tracking_info: api_call_response.tracking_info
+            };
+            if response.tracking_info.is_some() {
+                response.tracking_info.as_mut().unwrap().cached = !upstream_was_called;
+            }
+            Ok(response)
         }
         Err(error_data) => {
-            Err(ErrorStructure {
+            let mut response = ErrorStructure {
                 jsonrpc: request.jsonrpc.clone(),
                 id : request.id,
-                code: error_data.code,
-                message: error_data.message.to_string(),
-                error: error_data.error.clone()
-            })
+                error: error_data.error,
+                http_status: error_data.http_status,
+                tracking_info: error_data.tracking_info
+            };
+            if response.tracking_info.is_some() {
+                response.tracking_info.as_mut().unwrap().cached = !upstream_was_called;
+            }
+            Err(response)
         }
     }
 }
@@ -492,13 +554,15 @@ async fn api_call(
     let user_ip = match client_ip {
         Ok(ip) => ip,
         Err(_) => {
-            return HttpResponse::InternalServerError().json(ErrorStructure {
-                jsonrpc: "2.0".to_string(),
-                id: ID::Int(0),
-                code: -32000,
-                message: "Internal Server Error".to_string(),
-                error: ErrorField::Message("Invalid Cloudflare Proxy Header.".to_string()),
-            })
+            return HttpResponse::InternalServerError().json(json!({
+                "jsonrpc": "2.0",
+                "id": 0,
+                "error": {
+                    "code": -32000,
+                    "message": "Internal Server Error",
+                    "error": "Invalid Cloudflare Proxy Header."
+                }
+            }))
         }
     };
 
@@ -506,60 +570,74 @@ async fn api_call(
         APICall::Single(request) => {
             let result = handle_request(request, &data, &user_ip).await;
             match result {
-                Ok(response) => HttpResponse::Ok()
-                    .insert_header(("Drone-Version", DRONE_VERSION))
-                    .insert_header(("X-Jussi-Cache-Hit", response.cached.to_string()))
-                    .insert_header(("X-Jussi-Namespace", response.mapped_method.namespace))
-                    .insert_header(("X-Jussi-Api", response.mapped_method.api.unwrap_or("<Empty>".to_string())))
-                    .insert_header(("X-Jussi-Method", response.mapped_method.method))
-                    .insert_header(("X-Jussi-Params", response.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())))
-                    .insert_header(("X-Jussi-Backend-Url", response.backend_url))
-                    .insert_header(("X-Jussi-Upstream-Method", response.upstream_method))
-                    .json(serde_json::json!({
+                Ok(response) => {
+                    let mut reply_builder = HttpResponse::Ok();
+                    reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if let Some(tracking_info) = response.tracking_info {
+                        tracking_info.to_headers(&mut reply_builder);
+                    }
+                    reply_builder.json(serde_json::json!({
                         "jsonrpc": response.jsonrpc,
                         "result": response.result,
                         "id": response.id,
-                    })),
-                Err(err) => HttpResponse::InternalServerError().json(err),
+                    }))
+                },
+                Err(err) => {
+                    let mut reply_builder = HttpResponse::build(err.http_status);
+                    reply_builder.insert_header(("Drone-Version", DRONE_VERSION));
+                    if let Some(tracking_info) = err.tracking_info {
+                        tracking_info.to_headers(&mut reply_builder);
+                    }
+                    reply_builder.json(json!({
+                        "jsonrpc": err.jsonrpc,
+                        "id": err.id,
+                        "error": err.error
+                    }))
+                }
             }
         }
         APICall::Batch(requests) => {
-            let mut responses = Vec::new();
             if requests.len() > 100 {
-                return HttpResponse::InternalServerError().json(ErrorStructure {
-                    jsonrpc: "2.0".to_string(),
-                    id: ID::Int(0),
-                    code: -32600,
-                    message: "Request parameter error.".to_string(),
-                    error: ErrorField::Message(
-                        "Batch size too large, maximum allowed is 100.".to_string(),
-                    ),
-                });
+                return HttpResponse::InternalServerError().json(json!({
+                    "jsonrpc": "2.0".to_string(),
+                    "id": 0,
+                    "error": json!({
+                        "code": -32600,
+                        "message": "Request parameter error.",
+                        "error": "Batch size too large, maximum allowed is 100."
+                    }),
+                }));
             }
 
+            let mut responses = Vec::new();
+            // we'll say that the result was cached if all non-error responses came from the cache.
+            // the "cached" property isn't particularly useful for batch requests, so don't
+            // overthink it
+            let mut cached = true;
             for request in requests {
                 let result = handle_request(request, &data, &user_ip).await;
                 match result {
-                    Ok(response) => responses.push(response),
-                    Err(err) => return HttpResponse::InternalServerError().json(err),
+                    Ok(response) => {
+                        if !response.tracking_info.map_or(false, |v| v.cached) {
+                            cached = false;
+                        }
+                        responses.push(json!({
+                            "jsonrpc": response.jsonrpc,
+                            "result": response.result,
+                            "id": response.id,
+                        }))
+                    },
+                    Err(err) => responses.push(json!({
+                        "jsonrpc": err.jsonrpc,
+                        "id": err.id,
+                        "error": err.error
+                    }))
                 }
-            }
-            let mut cached = true;
-            let mut result = Vec::new();
-            for response in responses {
-                if !response.cached {
-                    cached = false;
-                }
-                result.push(serde_json::json!({
-                    "jsonrpc": response.jsonrpc,
-                    "result": response.result,
-                    "id": response.id,
-                }));
             }
             HttpResponse::Ok()
                 .insert_header(("Drone-Version", DRONE_VERSION))
                 .insert_header(("Cache-Status", cached.to_string()))
-                .json(serde_json::Value::Array(result))
+                .json(serde_json::Value::Array(responses))
         }
     }
 }

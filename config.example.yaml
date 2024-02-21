@@ -1,0 +1,181 @@
+---
+drone:
+  port: 9000
+  hostname: 0.0.0.0
+  cache_max_capacity: 4294967296 # 4GB
+  operator_message: "Drone by Deathwing"
+  middleware_connection_threads: 8
+# The remainder of this file is based on the information in existing jussi config files,
+# just in a more concise yaml format.
+
+# a list of backends Drone will send calls to, these are referenced 
+# in the 'urls' section
+backends:
+  hived: http://haproxy:7008
+  hivemind: http://haproxy:7002
+  hafah: http://haproxy:7003
+  hived-sync: http://haproxy:7006
+  hafsql: http://haproxy:7007
+
+# translate calls in these namespaces to appbase calls.  calls to methods
+# in other namespaces will not be translated.
+# This is done after jussi has rewritten the method name.
+translate_to_appbase:
+  - hived
+
+# tells jussi where to forward calls based on method name.
+# In this section, and in the ttls and timeouts section, the most specific match wins, 
+# the order they appear in this file doesn't matter
+urls:
+  bridge: hivemind
+  hafsql-api: hafsql
+  hive: hivemind
+  hived: hived
+  hived.network_broadcast_api.broadcast_transaction_synchronous: hived-sync
+  appbase: hived
+  appbase.condenser_api.get_account_reputations: hivemind
+  appbase.follow_api.get_account_reputations: hivemind
+  appbase.condenser_api.get_accounts: hived
+  appbase.condenser_api.broadcast_block: hived
+  appbase.condenser_api.broadcast_transaction: hived
+  appbase.condenser_api.broadcast_transaction_synchronous: hived-sync
+  appbase.network_broadcast_api.broadcast_transaction_synchronous: hived-sync
+  appbase.network_broadcast_api: hived
+  appbase.condenser_api.get_block: hived
+  appbase.block_api.get_block: hafah
+  appbase.block_api.get_block_header: hafah
+  appbase.block_api.get_block_range: hafah
+  appbase.account_history_api.get_account_history: hafah
+  appbase.account_history_api.get_ops_in_block: hafah
+  appbase.account_history_api.enum_virtual_ops: hafah
+  appbase.account_history_api.get_transaction: hafah
+  appbase.condenser_api.get_account_history: hafah
+  appbase.condenser_api.get_ops_in_block: hafah
+  appbase.condenser_api.enum_virtual_ops: hafah
+  appbase.condenser_api.get_transaction: hafah
+  appbase.condenser_api.get_active_votes: hivemind
+  appbase.condenser_api.get_blog: hivemind
+  appbase.condenser_api.get_blog_entries: hivemind
+  appbase.condenser_api.get_comment_discussions_by_payout: hivemind
+  appbase.condenser_api.get_content: hivemind
+  appbase.condenser_api.get_content_replies: hivemind
+  appbase.condenser_api.get_discussions_by_author_before_date: hivemind
+  appbase.condenser_api.get_discussions_by_blog: hivemind
+  appbase.condenser_api.get_discussions_by_comments: hivemind
+  appbase.condenser_api.get_discussions_by_created: hivemind
+  appbase.condenser_api.get_discussions_by_feed: hivemind
+  appbase.condenser_api.get_discussions_by_hot: hivemind
+  appbase.condenser_api.get_discussions_by_promoted: hivemind
+  appbase.condenser_api.get_discussions_by_trending: hivemind
+  appbase.condenser_api.get_follow_count: hivemind
+  appbase.condenser_api.get_followers: hivemind
+  appbase.condenser_api.get_following: hivemind
+  appbase.condenser_api.get_post_discussions_by_payout: hivemind
+  appbase.condenser_api.get_reblogged_by: hivemind
+  appbase.condenser_api.get_replies_by_last_update: hivemind
+  appbase.condenser_api.get_trending_tags: hivemind
+  appbase.database_api.list_comments: hivemind
+  appbase.database_api.list_votes: hivemind
+  appbase.database_api.find_votes: hivemind
+  appbase.database_api.find_comments: hivemind
+  appbase.tags_api.get_discussion: hivemind
+  appbase.condenser_api.get_state: hivemind
+
+# TTLs can have the values NO_EXPIRE, NO_CACHE, EXPIRE_IF_REVERSIBLE, 
+# or a positive integer number of seconds to cache the result.
+#
+# EXPIRE_IF_REVERSIBLE will act as if the TTL is 9 seconds if the data
+# is reversible, and forever if the data is irreversible.
+# Drone must know how to get the block number out of the response for
+# the call for EXPIRE_IF_REVERSIBLE to work, otherwise it will treat 
+# this as NO_CACHE.  Currently Drone knows how to decode get_block & 
+# get_block_header responses
+ttls:
+  hived: 3
+  hived.login_api: NO_CACHE
+  hived.network_broadcast_api: NO_CACHE
+  hived.follow_api: 10
+  hived.market_history_api: 1
+  hived.database_api: 3
+  hived.database_api.get_block: EXPIRE_IF_REVERSIBLE
+  hived.database_api.get_block_header: EXPIRE_IF_REVERSIBLE
+  hived.database_api.get_content: 1
+  hived.database_api.get_state: 1
+  # these were in the jussi config, but I don't think jussi was able to match on params.  Drone isn't either.
+  # hived.database_api.get_state.params=['/trending']: 30
+  # hived.database_api.get_state.params=['trending']: 30
+  # hived.database_api.get_state.params=['/hot']: 30
+  # hived.database_api.get_state.params=['/welcome']: 30
+  # hived.database_api.get_state.params=['/promoted']: 30
+  # hived.database_api.get_state.params=['/created']: 10
+  hived.database_api.get_dynamic_global_properties: 1
+  appbase: 1
+  appbase.block_api: EXPIRE_IF_REVERSIBLE
+  appbase.block_api.get_block_range: NO_CACHE
+  appbase.database_api: 1
+  appbase.condenser_api.get_account_reputations: 3600
+  appbase.condenser_api.get_block: EXPIRE_IF_REVERSIBLE
+  appbase.condenser_api.get_ticker: 1
+  appbase.condenser_api.get_accounts: 6
+  appbase.condenser_api.get_account_history: 6
+  appbase.condenser_api.get_content: 6
+  appbase.condenser_api.get_profile: 6
+  appbase.database_api.find_accounts: 3
+  appbase.condenser_api.get_dynamic_global_properties: 1
+  hive: NO_CACHE
+  bridge: NO_CACHE
+  bridge.get_discussion: 6
+  bridge.get_account_posts: 12
+  bridge.get_ranked_posts: 6
+  bridge.get_profile: 6
+  bridge.get_community: 6
+  bridge.get_post: 6
+  bridge.get_trending_topics: 3
+  hafsql: NO_CACHE
+
+# how long to wait for the backend to respond before giving up
+timeouts:
+  bridge: 30
+  hafsql: 30
+  hive: 30
+  hived: 5
+  hived.network_broadcast_api: 0
+  appbase: 3
+  appbase.chain_api.push_block: 0
+  appbase.chain_api.push_transaction: 0
+  appbase.network_broadcast_api: 0
+  appbase.condenser_api.broadcast_block: 0
+  appbase.condenser_api.broadcast_transaction: 0
+  appbase.condenser_api.broadcast_transaction_synchronous: 0
+  # appbase.condenser_api.get_ops_in_block.params=[2889020,false]: 20
+
+# method rewriting rules.  There are a few API calls where you can get the
+# same result by calling several different methods.  By default, Drone will
+# only share cache entries between calls where the method name and parameters
+# match.  So, Drone would treat database_api.get_block(1) and block_api.get_block(1)
+# as two completely different calls, and our cache hit rate would suffer.
+# Entries in `equivalent_methods` will cause Drone to replace the method name
+# so these calls are treated as one.
+#
+# destination_api.destination_method:
+# - appbase.source_api.source_method1
+# - appbase.source_api.source_method2
+#
+# Note, in this section, the source methods are in their full form (including namespace),
+# while the destination method should be the method as it would be called in the
+# json-rpc-request.
+equivalent_methods:
+  destination_api.destination_method:
+    - appbase.source_api.source_method
+  # these are similar, but the block_api version wraps the result in an extra block{}
+  #block_api.get_block:
+  #  - appbase.condenser_api.get_block
+  # need to check the rest of these to see if they're exactly equivalents
+  #block_api.get_block_header:
+  #  - condenser_api.get_block_header
+  #  - database_api.get_block_header
+  # these are similar, but I believe they have different asset representations
+  #account_history_api.get_ops_in_block:
+  #  - appbase.condenser_api.get_ops_in_block
+  #account_history_api.get_transaction:
+  #  - appbase.condenser_api.get_transaction
