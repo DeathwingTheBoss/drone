@@ -4,6 +4,7 @@ use serde_json::json;
 
 use super::config::AppConfig;
 use super::APIRequest;
+use super::ID;
 
 #[derive(Clone, Debug)]
 pub struct MethodAndParams {
@@ -38,7 +39,7 @@ impl MethodAndParams {
         // app_config isn't currently used, but we could use it if we want to, say,
         // send all translate_to_appbase calls using the "call" syntax
         APIRequest {
-            id: 1,
+            id: ID::Int(1),
             jsonrpc: "2.0".to_string(),
             method: self.full_method.to_string(),
             params: self.params.clone()
