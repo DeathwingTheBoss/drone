@@ -6,9 +6,9 @@ services:
         build: .
         image: "drone"
         ports:
-        - "3000:8999"
+        - "3000:9000"
         volumes:
-        - ./config.json:/config.json
+        - ./config.yaml:/config.yaml
         container_name: drone
         logging:
             driver: "json-file"

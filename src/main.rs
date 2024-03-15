@@ -62,16 +62,16 @@ async fn cache_size(appdata: web::Data<AppData>) -> impl Responder {
 }
 
 // return a list of cache keys and their sizes.  Can be huge
-async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
-    let entries: Vec<Value> = appdata.cache.iter().map(|(key, value)| {
-        json!({
-            "key": (*key).to_string(),
-            "size": value.size
-        })
-    }).collect();
+// async fn cache_entries(appdata: web::Data<AppData>) -> impl Responder {
+//     let entries: Vec<Value> = appdata.cache.iter().map(|(key, value)| {
+//         json!({
+//             "key": (*key).to_string(),
+//             "size": value.size
+//         })
+//     }).collect();
 
-    HttpResponse::Ok().json(entries)
-}
+//     HttpResponse::Ok().json(entries)
+// }
 
 // Enum for API Requests, either single or batch.
 #[derive(Deserialize, Debug)]
@@ -129,16 +129,16 @@ struct ResponseTrackingInfo {
 
 impl ResponseTrackingInfo {
     fn into_headers(self, reply_builder: &mut HttpResponseBuilder) {
-        reply_builder.insert_header(("X-Jussi-Cache-Hit", self.cached.to_string()));
-        reply_builder.insert_header(("X-Jussi-Namespace", self.mapped_method.namespace));
-        reply_builder.insert_header(("X-Jussi-Api", self.mapped_method.api.unwrap_or("<Empty>".to_string())));
-        reply_builder.insert_header(("X-Jussi-Method", self.mapped_method.method));
-        reply_builder.insert_header(("X-Jussi-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
+        reply_builder.insert_header(("X-Drone-Cache-Hit", self.cached.to_string()));
+        reply_builder.insert_header(("X-Drone-Namespace", self.mapped_method.namespace));
+        reply_builder.insert_header(("X-Drone-Api", self.mapped_method.api.unwrap_or("<Empty>".to_string())));
+        reply_builder.insert_header(("X-Drone-Method", self.mapped_method.method));
+        reply_builder.insert_header(("X-Drone-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
         if self.backend_url.is_some() {
-            reply_builder.insert_header(("X-Jussi-Backend-Url", self.backend_url.unwrap()));
+            reply_builder.insert_header(("X-Drone-Backend-Url", self.backend_url.unwrap()));
         }
         if self.upstream_method.is_some() {
-            reply_builder.insert_header(("X-Jussi-Upstream-Method", self.upstream_method.unwrap()));
+            reply_builder.insert_header(("X-Drone-Upstream-Method", self.upstream_method.unwrap()));
         }
     }
 }
@@ -699,7 +699,7 @@ async fn main() -> std::io::Result<()> {
         config: app_config.clone(),
         blockchain_state: Arc::new(RwLock::new(BlockchainState::new()))
     });
-    info!("Drone is running on port {}.", app_config.drone.port);
+    println!("Drone is running on port {}.", app_config.drone.port);
     HttpServer::new(move || {
         // let cors = Cors::default()
         //     .allowed_methods(vec!["GET", "POST"])
@@ -720,7 +720,7 @@ async fn main() -> std::io::Result<()> {
             .route("/", web::get().to(index))
             .route("/", web::post().to(api_call))
             .route("/health", web::get().to(index))
-            .route("/cache-entries", web::get().to(cache_entries))
+            // .route("/cache-entries", web::get().to(cache_entries))
             .route("/cache-size", web::get().to(cache_size))
     })
     .bind((app_config.drone.hostname, app_config.drone.port))?
