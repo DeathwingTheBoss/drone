@@ -130,16 +130,6 @@ struct ResponseTrackingInfo {
 impl ResponseTrackingInfo {
     fn into_headers(self, reply_builder: &mut HttpResponseBuilder) {
         reply_builder.insert_header(("X-Drone-Cache-Hit", self.cached.to_string()));
-        reply_builder.insert_header(("X-Drone-Namespace", self.mapped_method.namespace));
-        reply_builder.insert_header(("X-Drone-Api", self.mapped_method.api.unwrap_or("<Empty>".to_string())));
-        reply_builder.insert_header(("X-Drone-Method", self.mapped_method.method));
-        reply_builder.insert_header(("X-Drone-Params", self.mapped_method.params.map_or("[]".to_string(), |v| v.to_string())));
-        if self.backend_url.is_some() {
-            reply_builder.insert_header(("X-Drone-Backend-Url", self.backend_url.unwrap()));
-        }
-        if self.upstream_method.is_some() {
-            reply_builder.insert_header(("X-Drone-Upstream-Method", self.upstream_method.unwrap()));
-        }
     }
 }
 
